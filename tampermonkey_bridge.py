@@ -45,12 +45,18 @@ SMOOTH_SOFTWARE_MAX_WIDTH = 960
 SMOOTH_SOFTWARE_MAX_HEIGHT = 540
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 QUALITY_ALIASES = {
-    "": "max",
-    "max": "max",
-    "best": "max",
-    "highest": "max",
-    "source": "max",
-    "original": "max",
+    "": "max-fast",
+    "max": "max-fast",
+    "best": "max-fast",
+    "highest": "max-fast",
+    "source": "max-fast",
+    "original": "max-fast",
+    "max-fast": "max-fast",
+    "uncapped-fast": "max-fast",
+    "max_quick": "max-fast",
+    "max-quality": "max-quality",
+    "uncapped-quality": "max-quality",
+    "max_hq": "max-quality",
     "2160": "2160p",
     "2160p": "2160p",
     "4k": "2160p",
@@ -63,7 +69,8 @@ QUALITY_ALIASES = {
     "720p": "720p",
 }
 QUALITY_MAX_HEIGHTS = {
-    "max": None,
+    "max-fast": None,
+    "max-quality": None,
     "2160p": 2160,
     "1440p": 1440,
     "1080p": 1080,
@@ -87,6 +94,7 @@ MUX_AWARE_PAGE_HOST_SUFFIXES = (
     "bilibili.com",
     "qq.com",
 )
+UNCAPPED_QUALITY_PREFERENCES = {"max-fast", "max-quality"}
 
 
 @dataclass(slots=True)
@@ -325,7 +333,7 @@ def _hash_remote_media(media_url: str, profile: str) -> str:
 
 def normalize_quality_preference(value: Any) -> str:
     text = str(value or "").strip().lower()
-    return QUALITY_ALIASES.get(text, "max")
+    return QUALITY_ALIASES.get(text, "max-fast")
 
 
 def normalize_transcode_profile(value: Any) -> str:
@@ -337,7 +345,9 @@ def _quality_max_height(value: Any) -> int | None:
     return QUALITY_MAX_HEIGHTS[normalize_quality_preference(value)]
 
 
-def _prefers_mux_aware_page_resolution(source_url: str) -> bool:
+def _prefers_mux_aware_page_resolution(source_url: str, quality: str) -> bool:
+    if quality != "max-quality":
+        return False
     if not is_http_url(source_url) or is_probable_direct_media_url(source_url):
         return False
     hostname = (urlsplit(source_url).hostname or "").strip().lower()
@@ -1316,7 +1326,7 @@ class TampermonkeyBridgeService:
         quality: str = "max",
     ) -> BridgeResolvedSource:
         quality = normalize_quality_preference(quality)
-        if quality != "max":
+        if quality not in UNCAPPED_QUALITY_PREFERENCES:
             return resolve_source_with_yt_dlp_fallback(
                 source_url,
                 display_name=display_name,
@@ -1324,7 +1334,7 @@ class TampermonkeyBridgeService:
                 quality=quality,
             )
 
-        if _prefers_mux_aware_page_resolution(source_url):
+        if _prefers_mux_aware_page_resolution(source_url, quality):
             try:
                 return resolve_source_with_yt_dlp_fallback(
                     source_url,

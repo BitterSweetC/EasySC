@@ -445,7 +445,7 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
 
     @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
     @mock.patch("tampermonkey_bridge.resolve_media_source")
-    def test_service_resolve_source_prefers_mux_aware_fallback_for_bilibili_pages(
+    def test_service_resolve_source_prefers_mux_aware_fallback_for_bilibili_pages_when_max_quality_is_selected(
         self,
         resolve_media_source: mock.Mock,
         resolve_source_with_yt_dlp_fallback: mock.Mock,
@@ -464,14 +464,44 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
         )
 
         service = TampermonkeyBridgeService()
-        resolved = service.resolve_source("https://www.bilibili.com/video/BVdemo", display_name="Bili Demo")
+        resolved = service.resolve_source(
+            "https://www.bilibili.com/video/BVdemo",
+            display_name="Bili Demo",
+            quality="max-quality",
+        )
 
         resolve_media_source.assert_not_called()
         resolve_source_with_yt_dlp_fallback.assert_called_once()
-        self.assertEqual(resolve_source_with_yt_dlp_fallback.call_args.kwargs["quality"], "max")
+        self.assertEqual(resolve_source_with_yt_dlp_fallback.call_args.kwargs["quality"], "max-quality")
         self.assertTrue(resolved.requires_local_mux)
         self.assertEqual(resolved.video_url, "https://cdn.example.com/video_only.m4s")
         self.assertEqual(resolved.audio_url, "https://cdn.example.com/audio_only.m4s")
+
+    @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
+    @mock.patch("tampermonkey_bridge.resolve_media_source")
+    def test_service_resolve_source_uses_direct_extractor_for_bilibili_pages_when_max_fast_is_selected(
+        self,
+        resolve_media_source: mock.Mock,
+        resolve_source_with_yt_dlp_fallback: mock.Mock,
+    ) -> None:
+        resolve_media_source.return_value = ResolvedMediaSource(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Bili Demo",
+            original_url="https://www.bilibili.com/video/BVdemo",
+            headers={"User-Agent": "BridgeUA/1.0"},
+            resolved_from_page=True,
+        )
+
+        service = TampermonkeyBridgeService()
+        resolved = service.resolve_source(
+            "https://www.bilibili.com/video/BVdemo",
+            display_name="Bili Demo",
+            quality="max-fast",
+        )
+
+        resolve_source_with_yt_dlp_fallback.assert_not_called()
+        resolve_media_source.assert_called_once_with("https://www.bilibili.com/video/BVdemo")
+        self.assertEqual(resolved.media_url, "https://cdn.example.com/video/demo.m3u8")
 
     @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
     @mock.patch("tampermonkey_bridge.resolve_media_source")
@@ -494,6 +524,7 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
             "https://www.bilibili.com/video/BVdemo",
             display_name="Bili Demo",
             headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+            quality="max-quality",
         )
 
         resolve_source_with_yt_dlp_fallback.assert_called_once()

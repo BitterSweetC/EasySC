@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Video Cast to TV
 // @namespace    local.screen.casting
-// @version      0.5.9
+// @version      0.6.0
 // @description  Detect web video sources and send them to a local bridge for DLNA casting
 // @match        *://*/*
 // @grant        GM_addStyle
@@ -32,8 +32,9 @@
         sourceLabel: "\u89c6\u9891\u6e90",
         sourceHint: "\u4f18\u5148\u4f7f\u7528\u5f53\u524d\u9875\u9762\u89e3\u6790\u6216\u81ea\u52a8\u8bc6\u522b\u5230\u7684\u76f4\u94fe",
         qualityLabel: "\u753b\u8d28",
-        qualityHint: "\u53ea\u5bf9\u652f\u6301\u591a\u6863\u753b\u8d28\u7684\u64ad\u653e\u9875\u751f\u6548\uff0c\u624b\u52a8\u76f4\u94fe\u901a\u5e38\u4e0d\u4f1a\u6539\u753b\u8d28",
-        qualityBest: "\u4e0d\u8bbe\u4e0a\u9650\uff08\u5b9e\u9a8c\u6027\uff09",
+        qualityHint: "\u56fa\u5b9a\u5206\u8fa8\u7387\u4f1a\u9009\u4e0d\u8d85\u8fc7\u4e0a\u9650\u7684\u6700\u9ad8\u6863\uff1b\u201c\u4e0d\u8bbe\u4e0a\u9650\uff08\u5feb\u901f\uff09\u201d\u66f4\u504f\u5411\u5feb\u901f\u76f4\u6295\uff0c\u201c\u4e0d\u8bbe\u4e0a\u9650\uff08\u9ad8\u753b\u8d28\uff09\u201d\u66f4\u504f\u5411\u6700\u5927\u5316\u753b\u8d28\uff0c\u5728 Bilibili \u7b49 DASH \u9875\u9762\u53ef\u80fd\u9700\u8981\u5148\u4e0b\u8f7d\u518d\u5904\u7406",
+        qualityUnlimitedFast: "\u4e0d\u8bbe\u4e0a\u9650\uff08\u5feb\u901f\uff09",
+        qualityUnlimitedQuality: "\u4e0d\u8bbe\u4e0a\u9650\uff08\u9ad8\u753b\u8d28\uff09",
         quality2160: "2160p (4K)",
         quality1440: "1440p",
         quality1080: "1080p",
@@ -113,7 +114,13 @@
         if (text === "720" || text === "720p") {
             return "720p";
         }
-        return text === "max" ? "max" : "1080p";
+        if (text === "max-quality" || text === "uncapped-quality" || text === "max_hq") {
+            return "max-quality";
+        }
+        if (text === "max-fast" || text === "uncapped-fast" || text === "max_quick" || text === "max") {
+            return "max-fast";
+        }
+        return "1080p";
     }
 
     function normalizeTranscodeProfile(value) {
@@ -141,7 +148,10 @@
         if (quality === "720p") {
             return TEXT.quality720;
         }
-        return TEXT.qualityBest;
+        if (quality === "max-quality") {
+            return TEXT.qualityUnlimitedQuality;
+        }
+        return TEXT.qualityUnlimitedFast;
     }
 
     function getModeLabel(value) {
@@ -1431,7 +1441,8 @@
                         <option value="2160p">${TEXT.quality2160}</option>
                         <option value="1440p">${TEXT.quality1440}</option>
                         <option value="1080p">${TEXT.quality1080}</option>
-                        <option value="max">${TEXT.qualityBest}</option>
+                        <option value="max-fast">${TEXT.qualityUnlimitedFast}</option>
+                        <option value="max-quality">${TEXT.qualityUnlimitedQuality}</option>
                         <option value="720p">${TEXT.quality720}</option>
                     </select>
                 </div>
