@@ -1,0 +1,4 @@
+# Runtime dependencies for the public GitHub version of this project.
+# tkinter ships with the standard Windows Python installer and is not installed via pip.
+Pillow==12.1.1
+yt-dlp==2026.3.17

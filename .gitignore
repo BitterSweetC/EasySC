@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.spec
+.idea/
+.venv/
+venv/
+env/
+ENV/
+cache/
+*.log
+utf8_probe.txt
+bilibili视频下载 - 源代码.html
+bilibili视频下载 - 源代码_files/
