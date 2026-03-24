@@ -88,11 +88,24 @@ class BridgeTask:
     error: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class TranscodeAttempt:
+    effective_profile: str
+    encoder_name: str
+    smooth_fallback: bool = False
+    downgraded: bool = False
+    hardware: bool = False
+
+
 class CastStartError(RuntimeError):
     def __init__(self, message: str, *, served_media_url: str = "", player_url: str = "") -> None:
         super().__init__(message)
         self.served_media_url = served_media_url
         self.player_url = player_url
+
+
+_FFMPEG_ENCODER_LIST_CACHE: dict[str, set[str]] = {}
+_FFMPEG_HW_ENCODER_CACHE: dict[str, str] = {}
 
 
 def filter_forward_headers(values: Mapping[str, Any] | None) -> dict[str, str]:
@@ -184,6 +197,96 @@ def _profile_label(value: Any) -> str:
     if profile == "smooth":
         return "smooth 60fps"
     return "standard"
+
+
+def _ffmpeg_cache_key(ffmpeg_path: Path) -> str:
+    return str(ffmpeg_path.resolve()).lower()
+
+
+def _list_ffmpeg_encoders(ffmpeg_path: Path) -> set[str]:
+    cache_key = _ffmpeg_cache_key(ffmpeg_path)
+    cached = _FFMPEG_ENCODER_LIST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = subprocess.run(
+        [str(ffmpeg_path), "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        errors="ignore",
+        timeout=15,
+    )
+    encoders: set[str] = set()
+    output = f"{result.stdout}\n{result.stderr}"
+    for line in output.splitlines():
+        match = re.match(r"^\s*[VAS\.]{6}\s+([A-Za-z0-9_]+)\s+", line)
+        if match:
+            encoders.add(match.group(1))
+    _FFMPEG_ENCODER_LIST_CACHE[cache_key] = encoders
+    return encoders
+
+
+def _probe_hardware_encoder(ffmpeg_path: Path, encoder_name: str) -> bool:
+    command = [
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=128x72:rate=1:duration=1",
+        "-frames:v",
+        "1",
+        "-an",
+    ]
+    if encoder_name == "h264_nvenc":
+        command.extend(["-c:v", encoder_name, "-preset", "p5", "-cq", "28", "-b:v", "0"])
+    elif encoder_name == "h264_qsv":
+        command.extend(["-vf", "format=nv12", "-c:v", encoder_name, "-global_quality", "28"])
+    elif encoder_name == "h264_amf":
+        command.extend(["-vf", "format=nv12", "-c:v", encoder_name, "-quality", "speed"])
+    else:
+        return False
+    command.extend(["-f", "null", "-"])
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, errors="ignore", timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def detect_preferred_h264_hardware_encoder(ffmpeg_path: Path) -> str:
+    cache_key = _ffmpeg_cache_key(ffmpeg_path)
+    cached = _FFMPEG_HW_ENCODER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    encoders = _list_ffmpeg_encoders(ffmpeg_path)
+    for candidate in ("h264_nvenc", "h264_qsv", "h264_amf"):
+        if candidate not in encoders:
+            continue
+        if _probe_hardware_encoder(ffmpeg_path, candidate):
+            _FFMPEG_HW_ENCODER_CACHE[cache_key] = candidate
+            return candidate
+
+    _FFMPEG_HW_ENCODER_CACHE[cache_key] = ""
+    return ""
+
+
+def _build_transcode_attempts(transcode_profile: str, hardware_encoder: str = "") -> list[TranscodeAttempt]:
+    profile = normalize_transcode_profile(transcode_profile)
+    if profile == "standard":
+        return [TranscodeAttempt(effective_profile="standard", encoder_name="libx264")]
+    if profile == "quality":
+        return [TranscodeAttempt(effective_profile="quality", encoder_name="libx264")]
+    if hardware_encoder:
+        return [
+            TranscodeAttempt(effective_profile="smooth", encoder_name=hardware_encoder, hardware=True),
+            TranscodeAttempt(effective_profile="smooth", encoder_name=hardware_encoder, smooth_fallback=True, hardware=True),
+            TranscodeAttempt(effective_profile="quality", encoder_name="libx264", downgraded=True),
+        ]
+    return [TranscodeAttempt(effective_profile="quality", encoder_name="libx264", downgraded=True)]
 
 
 def _build_quality_format_selector(value: Any) -> str:
@@ -431,7 +534,7 @@ def _format_ffmpeg_headers(values: Mapping[str, Any] | None) -> str:
     return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
 
-def _build_video_filter_chain(transcode_profile: str, *, smooth_fallback: bool = False) -> str:
+def _build_video_filter_chain(transcode_profile: str, *, encoder_name: str = "libx264", smooth_fallback: bool = False) -> str:
     profile = normalize_transcode_profile(transcode_profile)
     filters = ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     if profile == "smooth":
@@ -439,6 +542,8 @@ def _build_video_filter_chain(transcode_profile: str, *, smooth_fallback: bool =
             filters.append("fps=60000/1001")
         else:
             filters.append("minterpolate=fps=60000/1001:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+    if encoder_name in {"h264_qsv", "h264_amf"}:
+        filters.append("format=nv12")
     return ",".join(filters)
 
 
@@ -447,12 +552,14 @@ def _append_transcode_output_options(
     output_file: Path,
     transcode_profile: str,
     *,
+    encoder_name: str = "libx264",
     smooth_fallback: bool = False,
 ) -> list[str]:
     profile = normalize_transcode_profile(transcode_profile)
     preset = "veryfast"
     crf = "23"
     audio_bitrate = "128k"
+    video_args: list[str]
 
     if profile == "quality":
         preset = "medium"
@@ -463,12 +570,8 @@ def _append_transcode_output_options(
         crf = "20"
         audio_bitrate = "160k"
 
-    command.extend(
-        [
-            "-map_metadata",
-            "-1",
-            "-sn",
-            "-dn",
+    if encoder_name == "libx264":
+        video_args = [
             "-c:v",
             "libx264",
             "-preset",
@@ -476,9 +579,69 @@ def _append_transcode_output_options(
             "-crf",
             crf,
             "-vf",
-            _build_video_filter_chain(profile, smooth_fallback=smooth_fallback),
+            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
             "-pix_fmt",
             "yuv420p",
+        ]
+    elif encoder_name == "h264_nvenc":
+        cq = "21" if profile == "quality" else "23"
+        video_args = [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            cq,
+            "-b:v",
+            "0",
+            "-vf",
+            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    elif encoder_name == "h264_qsv":
+        global_quality = "20" if profile == "quality" else "23"
+        video_args = [
+            "-c:v",
+            "h264_qsv",
+            "-global_quality",
+            global_quality,
+            "-preset",
+            "medium",
+            "-vf",
+            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+        ]
+    elif encoder_name == "h264_amf":
+        qp_p = "20" if profile == "quality" else "23"
+        qp_i = "18" if profile == "quality" else "21"
+        video_args = [
+            "-c:v",
+            "h264_amf",
+            "-usage",
+            "transcoding",
+            "-quality",
+            "quality",
+            "-rc",
+            "cqp",
+            "-qp_i",
+            qp_i,
+            "-qp_p",
+            qp_p,
+            "-vf",
+            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+        ]
+    else:
+        raise RuntimeError(f"Unsupported encoder: {encoder_name}")
+
+    command.extend(
+        [
+            "-map_metadata",
+            "-1",
+            "-sn",
+            "-dn",
+            *video_args,
             "-movflags",
             "+faststart",
             "-c:a",
@@ -501,38 +664,39 @@ def _run_transcode_command(
     transcode_profile: str,
 ) -> Path:
     profile = normalize_transcode_profile(transcode_profile)
+    hardware_encoder = detect_preferred_h264_hardware_encoder(ffmpeg_path) if profile == "smooth" else ""
+    attempts = _build_transcode_attempts(profile, hardware_encoder=hardware_encoder)
+    failure_sections: list[str] = []
 
-    primary_command = [str(ffmpeg_path), "-y", *input_args, *map_args]
-    _append_transcode_output_options(primary_command, output_file, profile, smooth_fallback=False)
-    primary_result = subprocess.run(primary_command, capture_output=True, text=True, errors="ignore")
-    if primary_result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
-        return output_file
-
-    if output_file.exists():
-        try:
-            output_file.unlink()
-        except OSError:
-            pass
-
-    fallback_result = None
-    if profile == "smooth":
-        fallback_command = [str(ffmpeg_path), "-y", *input_args, *map_args]
-        _append_transcode_output_options(fallback_command, output_file, profile, smooth_fallback=True)
-        fallback_result = subprocess.run(fallback_command, capture_output=True, text=True, errors="ignore")
-        if fallback_result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+    for attempt in attempts:
+        command = [str(ffmpeg_path), "-y", *input_args, *map_args]
+        _append_transcode_output_options(
+            command,
+            output_file,
+            attempt.effective_profile,
+            encoder_name=attempt.encoder_name,
+            smooth_fallback=attempt.smooth_fallback,
+        )
+        result = subprocess.run(command, capture_output=True, text=True, errors="ignore")
+        if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
             return output_file
 
-    primary_stderr = (primary_result.stderr or primary_result.stdout or "unknown ffmpeg error").strip()
-    tail_lines = []
-    if profile == "smooth" and fallback_result is not None:
-        fallback_stderr = (fallback_result.stderr or fallback_result.stdout or "unknown ffmpeg error").strip()
-        tail_lines.extend(["smooth transcode failed:"])
-        tail_lines.extend(primary_stderr.splitlines()[-8:])
-        tail_lines.extend(["smooth fallback failed:"])
-        tail_lines.extend(fallback_stderr.splitlines()[-8:])
-    else:
-        tail_lines.extend(primary_stderr.splitlines()[-12:])
-    tail = "\n".join(tail_lines[-20:])
+        stderr = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+        label = f"{attempt.effective_profile}/{attempt.encoder_name}"
+        if attempt.smooth_fallback:
+            label = f"{label} fallback"
+        if attempt.downgraded:
+            label = f"{label} downgraded"
+        failure_sections.extend([f"{label} failed:"])
+        failure_sections.extend(stderr.splitlines()[-8:])
+
+        if output_file.exists():
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+
+    tail = "\n".join(failure_sections[-20:])
     raise RuntimeError(f"ffmpeg failed to transcode remote media.\n{tail}")
 
 
@@ -647,6 +811,7 @@ class TampermonkeyBridgeService:
     def __init__(self) -> None:
         self.http_server = MediaHttpServer()
         self._lock = threading.RLock()
+        self._playback_lock = threading.RLock()
         self._devices_by_location: dict[str, DlnaDevice] = {}
         self._tasks: dict[str, BridgeTask] = {}
         self.current_controller: DlnaController | None = None
@@ -804,6 +969,12 @@ class TampermonkeyBridgeService:
         progress_callback: Any = None,
     ) -> dict[str, Any]:
         profile = normalize_transcode_profile(transcode_profile)
+        smooth_hardware_encoder = ""
+        if profile == "smooth":
+            try:
+                smooth_hardware_encoder = detect_preferred_h264_hardware_encoder(find_ffmpeg())
+            except FfmpegNotFoundError:
+                smooth_hardware_encoder = ""
         self._notify_progress(progress_callback, "resolving", "Resolving page source...")
         resolved = self.resolve_source(
             source_url,
@@ -822,20 +993,22 @@ class TampermonkeyBridgeService:
             self.current_controller = None
             self.current_device = None
 
-        if previous_controller is not None:
-            try:
-                previous_controller.stop()
-            except (ValueError, HTTPError, URLError, OSError):
-                pass
+        with self._playback_lock:
+            if previous_controller is not None:
+                try:
+                    previous_controller.stop()
+                except (ValueError, HTTPError, URLError, OSError):
+                    pass
 
-        with self._lock:
             if resolved.requires_local_mux:
                 if profile == "standard":
                     progress_message = "Downloading streams and preparing a compatible MP4..."
                 elif profile == "quality":
                     progress_message = "Downloading streams and applying local quality optimization..."
+                elif smooth_hardware_encoder:
+                    progress_message = "Downloading streams and rendering smoother 60fps playback with hardware encoding..."
                 else:
-                    progress_message = "Downloading streams and rendering smoother 60fps playback..."
+                    progress_message = "60fps hardware encoding unavailable. Falling back to local quality optimization..."
                 self._notify_progress(progress_callback, "muxing", progress_message)
                 muxed_file = mux_remote_streams_to_compatible_mp4(
                     video_url=resolved.video_url,
@@ -850,8 +1023,10 @@ class TampermonkeyBridgeService:
             elif profile != "standard":
                 if profile == "quality":
                     progress_message = "Applying local quality optimization..."
+                elif smooth_hardware_encoder:
+                    progress_message = "Rendering smoother 60fps playback with hardware encoding..."
                 else:
-                    progress_message = "Rendering smoother 60fps playback..."
+                    progress_message = "60fps hardware encoding unavailable. Falling back to local quality optimization..."
                 self._notify_progress(progress_callback, "transcoding", progress_message)
                 transcoded_file = transcode_remote_media_to_compatible_mp4(
                     media_url=resolved.media_url,
@@ -863,6 +1038,8 @@ class TampermonkeyBridgeService:
                 metadata_source = str(transcoded_file)
             else:
                 self._notify_progress(progress_callback, "serving", "Preparing media URL for the TV...")
+                if ".m3u8" in str(resolved.media_url or "").lower():
+                    self._notify_progress(progress_callback, "preloading", "Preloading a few HLS segments for smoother startup...")
                 served_media_url = self.http_server.start_remote(
                     resolved.media_url,
                     resolved.display_name,
@@ -871,22 +1048,22 @@ class TampermonkeyBridgeService:
                 metadata_source = resolved.media_url
             player_url = self.http_server.player_url or ""
 
-        controller = DlnaController(device)
-        try:
-            self._notify_progress(progress_callback, "casting", "Sending playback command to the TV...")
-            set_media_with_title(controller, served_media_url, metadata_source, resolved.display_name)
-            controller.play(str(speed or "1").strip() or "1")
-            if volume is not None:
-                try:
-                    controller.set_volume(int(volume))
-                except (ValueError, HTTPError, URLError, OSError):
-                    pass
-        except (ValueError, HTTPError, URLError, OSError, RuntimeError) as exc:
-            raise CastStartError(str(exc), served_media_url=served_media_url, player_url=player_url) from exc
+            controller = DlnaController(device)
+            try:
+                self._notify_progress(progress_callback, "casting", "Sending playback command to the TV...")
+                set_media_with_title(controller, served_media_url, metadata_source, resolved.display_name)
+                controller.play(str(speed or "1").strip() or "1")
+                if volume is not None:
+                    try:
+                        controller.set_volume(int(volume))
+                    except (ValueError, HTTPError, URLError, OSError):
+                        pass
+            except (ValueError, HTTPError, URLError, OSError, RuntimeError) as exc:
+                raise CastStartError(str(exc), served_media_url=served_media_url, player_url=player_url) from exc
 
-        with self._lock:
-            self.current_controller = controller
-            self.current_device = device
+            with self._lock:
+                self.current_controller = controller
+                self.current_device = device
 
         return {
             "ok": True,
@@ -930,19 +1107,20 @@ class TampermonkeyBridgeService:
         self._update_task(task_id, status="completed", message="Cast task completed.", result=result)
 
     def stop(self) -> dict[str, Any]:
-        with self._lock:
-            controller = self.current_controller
-            device_name = self.current_device.display_name if self.current_device else ""
-            self.current_controller = None
-            self.current_device = None
+        with self._playback_lock:
+            with self._lock:
+                controller = self.current_controller
+                device_name = self.current_device.display_name if self.current_device else ""
+                self.current_controller = None
+                self.current_device = None
 
-        if controller is not None:
-            try:
-                controller.stop()
-            except (ValueError, HTTPError, URLError, OSError):
-                pass
+            if controller is not None:
+                try:
+                    controller.stop()
+                except (ValueError, HTTPError, URLError, OSError):
+                    pass
 
-        self.http_server.stop()
+            self.http_server.stop()
         return {
             "ok": True,
             "stopped": True,

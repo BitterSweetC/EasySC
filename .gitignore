@@ -9,6 +9,7 @@ build/
 venv/
 env/
 ENV/
+.runtime/
 cache/
 *.log
 utf8_probe.txt

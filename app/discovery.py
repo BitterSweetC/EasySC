@@ -13,12 +13,13 @@ from app.models import DlnaDevice, DlnaService
 
 SSDP_ADDRESS = ("239.255.255.250", 1900)
 SEARCH_TARGETS = [
-    "ssdp:all",
-    "upnp:rootdevice",
     "urn:schemas-upnp-org:device:MediaRenderer:1",
     "urn:schemas-upnp-org:service:AVTransport:1",
     "urn:schemas-upnp-org:service:RenderingControl:1",
+    "upnp:rootdevice",
+    "ssdp:all",
 ]
+BROAD_SEARCH_TARGETS = {"ssdp:all", "upnp:rootdevice"}
 SSDP_TEMPLATE = "\r\n".join(
     [
         "M-SEARCH * HTTP/1.1",
@@ -31,6 +32,10 @@ SSDP_TEMPLATE = "\r\n".join(
     ]
 )
 RECV_TIMEOUT = 0.15
+MIN_DESCRIPTION_FETCH_TIMEOUT = 0.2
+MAX_DESCRIPTION_FETCH_TIMEOUT = 2.0
+MIN_DESCRIPTION_FETCH_RESERVE = 0.75
+MAX_DESCRIPTION_FETCH_RESERVE = 1.5
 
 
 def parse_ssdp_response(data: bytes) -> Dict[str, str]:
@@ -175,12 +180,63 @@ def _is_probable_renderer(device: DlnaDevice, headers: Dict[str, str], usn: str)
     return device.supports_media_cast or device.rendering_control is not None or "mediarenderer" in discovery_hint
 
 
+def _discovery_hint_from_headers(headers: Dict[str, str], usn: str) -> str:
+    return " ".join(
+        part for part in [headers.get("st", ""), headers.get("server", ""), usn] if part
+    ).lower()
+
+
+def _discovery_candidate_priority(headers: Dict[str, str], usn: str) -> int:
+    hint = _discovery_hint_from_headers(headers, usn)
+    score = 0
+    if "mediarenderer" in hint:
+        score += 12
+    if "avtransport" in hint:
+        score += 8
+    if "renderingcontrol" in hint:
+        score += 6
+    if "dlna" in hint or "dmr" in hint:
+        score += 2
+    return score
+
+
+def _split_search_targets(search_targets: Sequence[str]) -> tuple[list[str], list[str]]:
+    targeted = [target for target in search_targets if target not in BROAD_SEARCH_TARGETS]
+    if not targeted:
+        return list(search_targets), []
+    fallback = [target for target in search_targets if target in BROAD_SEARCH_TARGETS]
+    return targeted, fallback
+
+
+def _description_fetch_reserve(timeout: float) -> float:
+    return min(MAX_DESCRIPTION_FETCH_RESERVE, max(MIN_DESCRIPTION_FETCH_RESERVE, timeout * 0.25))
+
+
+def _description_fetch_timeout(deadline: float, pending_count: int) -> float:
+    remaining = max(deadline - time.monotonic(), 0.0)
+    if remaining <= 0:
+        return 0.0
+    if pending_count <= 1:
+        return min(MAX_DESCRIPTION_FETCH_TIMEOUT, remaining)
+    if remaining <= MIN_DESCRIPTION_FETCH_TIMEOUT:
+        return remaining
+    return min(MAX_DESCRIPTION_FETCH_TIMEOUT, max(MIN_DESCRIPTION_FETCH_TIMEOUT, remaining / pending_count))
+
+
+def _sorted_discovery_results(
+    results: Dict[str, tuple[Dict[str, str], str]]
+) -> list[tuple[str, tuple[Dict[str, str], str]]]:
+    items = list(results.items())
+    items.sort(key=lambda item: (-_discovery_candidate_priority(item[1][0], item[1][1]), item[0]))
+    return items
+
+
 def fetch_device_description(location: str, usn: str, headers: Dict[str, str], timeout: float = 3.0) -> Optional[DlnaDevice]:
     request = urllib.request.Request(location, headers={"User-Agent": "ScreenCasting/0.1"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             xml_text = response.read().decode("utf-8", errors="ignore")
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None
 
     try:
@@ -240,6 +296,8 @@ def _create_search_socket(local_ip: str) -> socket.socket:
 
 
 def discover_devices(timeout: float = 5.0, search_targets: Sequence[str] = SEARCH_TARGETS) -> List[DlnaDevice]:
+    timeout = max(float(timeout), 0.5)
+    deadline = time.monotonic() + timeout
     results: Dict[str, tuple[Dict[str, str], str]] = {}
     local_ips = iter_local_ipv4_addresses()
     sockets: List[socket.socket] = []
@@ -256,16 +314,23 @@ def discover_devices(timeout: float = 5.0, search_targets: Sequence[str] = SEARC
             fallback.settimeout(RECV_TIMEOUT)
             sockets.append(fallback)
 
-        payloads = [SSDP_TEMPLATE.format(st=target).encode("utf-8") for target in search_targets]
+        targeted_targets, fallback_targets = _split_search_targets(search_targets)
+        targeted_payloads = [SSDP_TEMPLATE.format(st=target).encode("utf-8") for target in targeted_targets]
+        fallback_payloads = [SSDP_TEMPLATE.format(st=target).encode("utf-8") for target in fallback_targets]
         rounds = max(2, min(4, int(timeout) + 1))
         round_interval = max(0.8, timeout / max(rounds, 1))
-        deadline = time.monotonic() + timeout
+        fetch_reserve = _description_fetch_reserve(timeout)
         next_send_at = time.monotonic()
         sent_rounds = 0
 
         while time.monotonic() < deadline:
             now = time.monotonic()
+            if results and deadline - now <= fetch_reserve:
+                break
             if sent_rounds < rounds and now >= next_send_at:
+                payloads = targeted_payloads
+                if not results and fallback_payloads and sent_rounds >= rounds - 1:
+                    payloads = targeted_payloads + fallback_payloads
                 for sock in sockets:
                     for payload in payloads:
                         try:
@@ -284,16 +349,26 @@ def discover_devices(timeout: float = 5.0, search_targets: Sequence[str] = SEARC
                     continue
                 headers = parse_ssdp_response(data)
                 location = headers.get("location")
-                if not location or location in results:
+                usn = headers.get("usn", "")
+                if not location:
                     continue
-                results[location] = (headers, headers.get("usn", ""))
+                existing = results.get(location)
+                if existing is not None:
+                    current_score = _discovery_candidate_priority(headers, usn)
+                    existing_score = _discovery_candidate_priority(existing[0], existing[1])
+                    if current_score <= existing_score:
+                        continue
+                results[location] = (headers, usn)
     finally:
         for sock in sockets:
             sock.close()
 
     devices: List[DlnaDevice] = []
-    fetch_timeout = min(max(timeout, 2.0), 5.0)
-    for location, (headers, usn) in results.items():
+    candidates = _sorted_discovery_results(results)
+    for index, (location, (headers, usn)) in enumerate(candidates):
+        fetch_timeout = _description_fetch_timeout(deadline, len(candidates) - index)
+        if fetch_timeout <= 0:
+            break
         device = fetch_device_description(location, usn, headers, timeout=fetch_timeout)
         if device is not None:
             devices.append(device)

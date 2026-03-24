@@ -1,4 +1,6 @@
 ﻿import html
+from collections import OrderedDict
+from dataclasses import dataclass
 import mimetypes
 import re
 import socket
@@ -7,7 +9,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 BUFFER_SIZE = 64 * 1024
@@ -19,6 +21,151 @@ MANIFEST_CONTENT_TYPES = (
     "audio/mpegurl",
 )
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+REMOTE_PREFETCH_SEGMENTS = 3
+REMOTE_PREFETCH_MAX_DEPTH = 2
+REMOTE_PREFETCH_MAX_CHILD_MANIFESTS = 4
+REMOTE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
+REMOTE_CACHE_MAX_TOTAL_BYTES = 24 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class RemoteCacheEntry:
+    payload: bytes
+    content_type: str
+    headers: dict[str, str]
+
+
+def build_proxy_url(base_url: str, proxy_path: str, source_url: str) -> str:
+    return f"{base_url}{proxy_path}?url={quote(source_url, safe='')}"
+
+
+def rewrite_manifest_payload(payload: bytes, source_url: str, base_url: str, proxy_path: str) -> bytes:
+    text = payload.decode("utf-8-sig", errors="ignore")
+    trailing_newline = text.endswith("\n")
+    rewritten_lines: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            rewritten_lines.append(line)
+            continue
+        if stripped.startswith("#"):
+            rewritten_lines.append(
+                MANIFEST_URI_PATTERN.sub(
+                    lambda match: f'URI="{build_proxy_url(base_url, proxy_path, urljoin(source_url, match.group(1)))}"',
+                    line,
+                )
+            )
+            continue
+        rewritten_lines.append(build_proxy_url(base_url, proxy_path, urljoin(source_url, stripped)))
+
+    rewritten = "\n".join(rewritten_lines)
+    if trailing_newline:
+        rewritten += "\n"
+    return rewritten.encode("utf-8")
+
+
+def extract_manifest_targets(payload: bytes, source_url: str) -> list[tuple[str, str]]:
+    text = payload.decode("utf-8-sig", errors="ignore")
+    targets: list[tuple[str, str]] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            for match in MANIFEST_URI_PATTERN.finditer(line):
+                targets.append(("attribute", urljoin(source_url, match.group(1))))
+            continue
+        targets.append(("line", urljoin(source_url, stripped)))
+
+    return targets
+
+
+def classify_manifest(payload: bytes) -> str:
+    text = payload.decode("utf-8-sig", errors="ignore")
+    if "#EXT-X-STREAM-INF" in text:
+        return "master"
+    if "#EXTINF" in text or "#EXT-X-TARGETDURATION" in text or "#EXT-X-MEDIA-SEQUENCE" in text:
+        return "media"
+    return "unknown"
+
+
+def looks_like_manifest_url(source_url: str) -> bool:
+    lowered = source_url.strip().lower()
+    if ".m3u8" in lowered or lowered.endswith(".m3u"):
+        return True
+    split = urlsplit(source_url)
+    combined = f"{split.query}&{split.fragment}".lower()
+    return ".m3u8" in combined
+
+
+def is_manifest_response(source_url: str, content_type: str) -> bool:
+    lowered_type = content_type.lower()
+    lowered_path = urlsplit(source_url).path.lower()
+    return lowered_path.endswith(".m3u8") or any(token in lowered_type for token in MANIFEST_CONTENT_TYPES)
+
+
+def _cache_response_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
+    if not headers:
+        return {}
+    values: dict[str, str] = {}
+    for name in ("ETag", "Last-Modified"):
+        value = headers.get(name)
+        if value:
+            values[name] = str(value)
+    return values
+
+
+def lookup_remote_cache_entry(server: object, source_url: str) -> RemoteCacheEntry | None:
+    cache = getattr(server, "remote_cache", None)
+    lock = getattr(server, "remote_cache_lock", None)
+    if cache is None or lock is None:
+        return None
+    with lock:
+        entry = cache.get(source_url)
+        if entry is None:
+            return None
+        cache.move_to_end(source_url)
+        return entry
+
+
+def store_remote_cache_entry(
+    server: object,
+    source_url: str,
+    payload: bytes,
+    content_type: str,
+    headers: Mapping[str, str] | None = None,
+) -> bool:
+    cache = getattr(server, "remote_cache", None)
+    lock = getattr(server, "remote_cache_lock", None)
+    cache_bytes = getattr(server, "remote_cache_bytes", None)
+    if cache is None or lock is None or cache_bytes is None:
+        return False
+
+    payload_size = len(payload)
+    if payload_size <= 0 or payload_size > REMOTE_CACHE_MAX_ITEM_BYTES:
+        return False
+
+    with lock:
+        existing = cache.pop(source_url, None)
+        if existing is not None:
+            server.remote_cache_bytes = max(0, int(server.remote_cache_bytes) - len(existing.payload))  # type: ignore[attr-defined]
+
+        while cache and int(server.remote_cache_bytes) + payload_size > REMOTE_CACHE_MAX_TOTAL_BYTES:  # type: ignore[attr-defined]
+            _, evicted = cache.popitem(last=False)
+            server.remote_cache_bytes = max(0, int(server.remote_cache_bytes) - len(evicted.payload))  # type: ignore[attr-defined]
+
+        if int(server.remote_cache_bytes) + payload_size > REMOTE_CACHE_MAX_TOTAL_BYTES:  # type: ignore[attr-defined]
+            return False
+
+        cache[source_url] = RemoteCacheEntry(
+            payload=payload,
+            content_type=content_type,
+            headers=_cache_response_headers(headers),
+        )
+        server.remote_cache_bytes = int(server.remote_cache_bytes) + payload_size  # type: ignore[attr-defined]
+    return True
 
 
 def get_local_ip() -> str:
@@ -160,39 +307,58 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
         return headers
 
     def _is_manifest_response(self, source_url: str, content_type: str) -> bool:
-        lowered_type = content_type.lower()
-        lowered_path = urlsplit(source_url).path.lower()
-        return lowered_path.endswith(".m3u8") or any(token in lowered_type for token in MANIFEST_CONTENT_TYPES)
+        return is_manifest_response(source_url, content_type)
 
     def _build_proxy_url(self, source_url: str) -> str:
         base_url = self.server.base_url  # type: ignore[attr-defined]
         proxy_path = self.server.proxy_path  # type: ignore[attr-defined]
-        return f"{base_url}{proxy_path}?url={quote(source_url, safe='')}"
+        return build_proxy_url(base_url, proxy_path, source_url)
 
     def _rewrite_manifest(self, payload: bytes, source_url: str) -> bytes:
-        text = payload.decode("utf-8-sig", errors="ignore")
-        trailing_newline = text.endswith("\n")
-        rewritten_lines: list[str] = []
+        base_url = self.server.base_url  # type: ignore[attr-defined]
+        proxy_path = self.server.proxy_path  # type: ignore[attr-defined]
+        return rewrite_manifest_payload(payload, source_url, base_url, proxy_path)
 
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                rewritten_lines.append(line)
-                continue
-            if stripped.startswith("#"):
-                rewritten_lines.append(
-                    MANIFEST_URI_PATTERN.sub(
-                        lambda match: f'URI="{self._build_proxy_url(urljoin(source_url, match.group(1)))}"',
-                        line,
-                    )
-                )
-                continue
-            rewritten_lines.append(self._build_proxy_url(urljoin(source_url, stripped)))
+    def _serve_cached_remote(self, send_body: bool, source_url: str) -> bool:
+        entry = lookup_remote_cache_entry(self.server, source_url)
+        if entry is None:
+            return False
 
-        rewritten = "\n".join(rewritten_lines)
-        if trailing_newline:
-            rewritten += "\n"
-        return rewritten.encode("utf-8")
+        payload = entry.payload
+        total_size = len(payload)
+        try:
+            range_header = self.headers.get("Range")
+            if range_header:
+                byte_range = parse_range_header(range_header, total_size)
+                if byte_range is None:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total_size}")
+                    self.end_headers()
+                    return True
+                start, end = byte_range
+                body = payload[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total_size}")
+            else:
+                body = payload
+                self.send_response(200)
+
+            self.send_header("Content-Type", entry.content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Accept-Ranges", "bytes")
+            for name, value in entry.headers.items():
+                if value:
+                    self.send_header(name, value)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            if send_body:
+                self.wfile.write(body)
+        except CLIENT_DISCONNECT_ERRORS:
+            return True
+        return True
 
     def _copy_upstream_headers(self, response: object, *, content_length: Optional[int] = None, content_type: Optional[str] = None) -> None:
         headers = response.headers  # type: ignore[attr-defined]
@@ -212,6 +378,9 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
 
     def _serve_remote(self, send_body: bool, source_url: str) -> None:
+        if self._serve_cached_remote(send_body, source_url):
+            return
+
         request = urllib.request.Request(
             source_url,
             headers=self._forward_remote_headers(),
@@ -219,9 +388,19 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                content_type = response.headers.get("Content-Type") or (mimetypes.guess_type(urlsplit(source_url).path)[0] or "application/octet-stream")
-                if send_body and self._is_manifest_response(source_url, content_type):
-                    payload = self._rewrite_manifest(response.read(), source_url)
+                effective_url = response.geturl() or source_url
+                content_type = response.headers.get("Content-Type") or (
+                    mimetypes.guess_type(urlsplit(effective_url).path)[0] or "application/octet-stream"
+                )
+                if send_body and self._is_manifest_response(effective_url, content_type):
+                    payload = self._rewrite_manifest(response.read(), effective_url)
+                    store_remote_cache_entry(
+                        self.server,
+                        source_url,
+                        payload,
+                        "application/vnd.apple.mpegurl; charset=utf-8",
+                        response.headers,
+                    )
                     self.send_response(200)
                     self._copy_upstream_headers(response, content_length=len(payload), content_type="application/vnd.apple.mpegurl; charset=utf-8")
                     self.end_headers()
@@ -383,6 +562,9 @@ class MediaHttpServer:
         server.proxy_path = proxy_path  # type: ignore[attr-defined]
         server.remote_media_url = None  # type: ignore[attr-defined]
         server.remote_headers = {}  # type: ignore[attr-defined]
+        server.remote_cache = OrderedDict()  # type: ignore[attr-defined]
+        server.remote_cache_lock = threading.RLock()  # type: ignore[attr-defined]
+        server.remote_cache_bytes = 0  # type: ignore[attr-defined]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
@@ -413,6 +595,9 @@ class MediaHttpServer:
         server.proxy_path = proxy_path  # type: ignore[attr-defined]
         server.remote_media_url = media_url  # type: ignore[attr-defined]
         server.remote_headers = dict(headers or {})  # type: ignore[attr-defined]
+        server.remote_cache = OrderedDict()  # type: ignore[attr-defined]
+        server.remote_cache_lock = threading.RLock()  # type: ignore[attr-defined]
+        server.remote_cache_bytes = 0  # type: ignore[attr-defined]
         server.player_title = display_name  # type: ignore[attr-defined]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -421,6 +606,7 @@ class MediaHttpServer:
         server.base_url = base_url  # type: ignore[attr-defined]
         local_media_url = f"{base_url}{url_path}"
         server.player_media_url = local_media_url  # type: ignore[attr-defined]
+        self._warm_remote_cache(server, media_url, dict(headers or {}))
 
         self._media_file = None
         self._media_url = local_media_url
@@ -429,6 +615,86 @@ class MediaHttpServer:
         self._server = server
         self._thread = thread
         return self._media_url
+
+    def _fetch_remote_payload(
+        self,
+        source_url: str,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Tuple[bytes, str, Mapping[str, str], str]:
+        request = urllib.request.Request(source_url, headers=dict(headers or {}), method="GET")
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read()
+            effective_url = response.geturl() or source_url
+            content_type = response.headers.get("Content-Type") or (
+                mimetypes.guess_type(urlsplit(effective_url).path)[0] or "application/octet-stream"
+            )
+            return payload, content_type, response.headers, effective_url
+
+    def _prefetch_remote_url(
+        self,
+        server: ThreadingHTTPServer,
+        source_url: str,
+        headers: Optional[dict[str, str]],
+        depth: int,
+        visited: set[str],
+    ) -> None:
+        if depth < 0 or source_url in visited:
+            return
+        visited.add(source_url)
+        if lookup_remote_cache_entry(server, source_url) is not None:
+            return
+
+        try:
+            payload, content_type, response_headers, effective_url = self._fetch_remote_payload(source_url, headers=headers)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            return
+
+        if not is_manifest_response(effective_url, content_type):
+            store_remote_cache_entry(server, source_url, payload, content_type, response_headers)
+            return
+
+        rewritten = rewrite_manifest_payload(payload, effective_url, server.base_url, server.proxy_path)  # type: ignore[attr-defined]
+        store_remote_cache_entry(
+            server,
+            source_url,
+            rewritten,
+            "application/vnd.apple.mpegurl; charset=utf-8",
+            response_headers,
+        )
+
+        manifest_kind = classify_manifest(payload)
+        targets = extract_manifest_targets(payload, effective_url)
+        if manifest_kind == "master":
+            for _, target_url in targets[:REMOTE_PREFETCH_MAX_CHILD_MANIFESTS]:
+                self._prefetch_remote_url(server, target_url, headers, depth - 1, visited)
+            return
+
+        attribute_targets = [target_url for kind, target_url in targets if kind == "attribute"]
+        line_targets = [target_url for kind, target_url in targets if kind == "line"]
+
+        for target_url in attribute_targets[:REMOTE_PREFETCH_MAX_CHILD_MANIFESTS]:
+            next_depth = depth - 1 if looks_like_manifest_url(target_url) else 0
+            self._prefetch_remote_url(server, target_url, headers, next_depth, visited)
+
+        prefetched_segments = 0
+        for target_url in line_targets:
+            if looks_like_manifest_url(target_url):
+                self._prefetch_remote_url(server, target_url, headers, depth - 1, visited)
+                continue
+            self._prefetch_remote_url(server, target_url, headers, 0, visited)
+            prefetched_segments += 1
+            if prefetched_segments >= REMOTE_PREFETCH_SEGMENTS:
+                break
+
+    def _warm_remote_cache(
+        self,
+        server: ThreadingHTTPServer,
+        media_url: str,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        if not looks_like_manifest_url(media_url):
+            return
+        self._prefetch_remote_url(server, media_url, headers, REMOTE_PREFETCH_MAX_DEPTH, set())
 
     def stop(self) -> None:
         if self._server is not None:

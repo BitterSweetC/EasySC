@@ -16,11 +16,22 @@ class FfmpegNotFoundError(RuntimeError):
     pass
 
 
+def _project_ffmpeg_candidates() -> list[Path]:
+    runtime_root = PROJECT_ROOT / ".runtime"
+    return [
+        runtime_root / "ffmpeg" / "ffmpeg.exe",
+        runtime_root / "ffmpeg.exe",
+        PROJECT_ROOT / "ffmpeg.exe",
+    ]
+
+
 def _candidate_ffmpeg_paths() -> list[Path]:
     candidates: list[Path] = []
     env_value = os.environ.get("SCREEN_CASTING_FFMPEG")
     if env_value:
         candidates.append(Path(env_value))
+
+    candidates.extend(_project_ffmpeg_candidates())
 
     which_value = shutil.which("ffmpeg")
     if which_value:

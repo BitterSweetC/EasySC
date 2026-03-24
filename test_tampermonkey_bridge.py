@@ -7,7 +7,16 @@ from unittest import mock
 
 from app.models import DlnaDevice, DlnaService
 from app.web_video_extractor import ResolvedMediaSource
-from tampermonkey_bridge import TampermonkeyBridgeService, create_bridge_server, filter_forward_headers, resolve_source_with_yt_dlp_fallback
+import tampermonkey_bridge
+from tampermonkey_bridge import (
+    BridgeTask,
+    TampermonkeyBridgeService,
+    _build_transcode_attempts,
+    create_bridge_server,
+    detect_preferred_h264_hardware_encoder,
+    filter_forward_headers,
+    resolve_source_with_yt_dlp_fallback,
+)
 
 
 def sample_device() -> DlnaDevice:
@@ -29,6 +38,10 @@ def sample_device() -> DlnaDevice:
 
 
 class TampermonkeyBridgeServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tampermonkey_bridge._FFMPEG_ENCODER_LIST_CACHE.clear()
+        tampermonkey_bridge._FFMPEG_HW_ENCODER_CACHE.clear()
+
     def test_filter_forward_headers_is_case_insensitive(self) -> None:
         headers = filter_forward_headers(
             {
@@ -221,6 +234,62 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
         resolve_media_source.assert_not_called()
         resolve_source_with_yt_dlp_fallback.assert_called_once()
         self.assertEqual(resolve_source_with_yt_dlp_fallback.call_args.kwargs["quality"], "720p")
+
+    def test_build_transcode_attempts_downgrades_smooth_without_hardware(self) -> None:
+        attempts = _build_transcode_attempts("smooth", hardware_encoder="")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].effective_profile, "quality")
+        self.assertEqual(attempts[0].encoder_name, "libx264")
+        self.assertTrue(attempts[0].downgraded)
+
+    def test_get_task_is_not_blocked_by_playback_lock(self) -> None:
+        service = TampermonkeyBridgeService()
+        with service._lock:
+            service._tasks["task-1"] = BridgeTask(
+                task_id="task-1",
+                status="transcoding",
+                message="Rendering smoother 60fps playback with hardware encoding...",
+            )
+
+        payload: dict[str, object] = {}
+
+        service._playback_lock.acquire()
+        try:
+            thread = threading.Thread(target=lambda: payload.update(result=service.get_task("task-1")))
+            thread.start()
+            thread.join(timeout=0.5)
+            self.assertFalse(thread.is_alive(), "get_task should not wait for playback work")
+        finally:
+            service._playback_lock.release()
+            if "thread" in locals() and thread.is_alive():
+                thread.join(timeout=1)
+
+        self.assertIsNotNone(payload.get("result"))
+        self.assertEqual(payload["result"]["task_id"], "task-1")  # type: ignore[index]
+
+    @mock.patch("tampermonkey_bridge.subprocess.run")
+    def test_detect_preferred_hardware_encoder_skips_unusable_nvenc_and_uses_qsv(self, subprocess_run: mock.Mock) -> None:
+        ffmpeg_path = Path(r"C:\ffmpeg\bin\ffmpeg.exe")
+
+        subprocess_run.side_effect = [
+            mock.Mock(
+                returncode=0,
+                stdout="\n".join(
+                    [
+                        " V..... h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)",
+                        " V..... h264_qsv             H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (Intel Quick Sync Video acceleration) (codec h264)",
+                    ]
+                ),
+                stderr="",
+            ),
+            mock.Mock(returncode=1, stdout="", stderr="nvenc unavailable"),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+
+        encoder = detect_preferred_h264_hardware_encoder(ffmpeg_path)
+
+        self.assertEqual(encoder, "h264_qsv")
+        self.assertEqual(subprocess_run.call_count, 3)
 
 
 class BridgeHttpApiTests(unittest.TestCase):

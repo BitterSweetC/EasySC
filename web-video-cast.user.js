@@ -356,6 +356,9 @@
         if (value === "serving") {
             return "\u6b63\u5728\u51c6\u5907\u6295\u5c4f\u94fe\u63a5...";
         }
+        if (value === "preloading") {
+            return "\u6b63\u5728\u5148\u7f13\u51b2\u524d\u51e0\u6bb5 HLS \u89c6\u9891\uff0c\u5c3d\u91cf\u51cf\u5c11\u5f00\u64ad\u540e\u5361\u987f...";
+        }
         if (value === "casting") {
             return "\u6b63\u5728\u628a\u64ad\u653e\u6307\u4ee4\u53d1\u9001\u5230\u7535\u89c6...";
         }
@@ -388,6 +391,7 @@
             "Downloading streams and rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u7248\u672c...",
             "60fps hardware encoding unavailable. Falling back to local quality optimization...": "60fps \u786c\u4ef6\u7f16\u7801\u4e0d\u53ef\u7528\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u4e3a\u753b\u8d28\u4f18\u5316\u3002",
             "Preparing media URL for the TV...": "\u6b63\u5728\u51c6\u5907\u6295\u5c4f\u94fe\u63a5...",
+            "Preloading a few HLS segments for smoother startup...": "\u6b63\u5728\u5148\u7f13\u51b2\u524d\u51e0\u6bb5 HLS \u89c6\u9891\uff0c\u5c3d\u91cf\u51cf\u5c11\u5f00\u64ad\u540e\u5361\u987f...",
             "Applying local quality optimization...": "\u6b63\u5728\u505a\u672c\u5730\u753b\u8d28\u4f18\u5316...",
             "Rendering smoother 60fps playback...": "\u6b63\u5728\u751f\u6210\u66f4\u6d41\u7545\u7684 60fps \u64ad\u653e\u7248\u672c...",
             "Rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u64ad\u653e\u7248\u672c...",
