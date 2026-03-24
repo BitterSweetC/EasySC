@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Web Video Cast to TV
 // @namespace    local.screen.casting
-// @version      0.5.1
+// @version      0.5.6
 // @description  Detect web video sources and send them to a local bridge for DLNA casting
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @noframes
 // @run-at       document-start
 // ==/UserScript==
 
@@ -22,6 +23,9 @@
         bridgeLabel: "\u672c\u5730 Bridge",
         bridgeHint: "\u5982\u679c\u8fde\u63a5\u5931\u8d25\uff0c\u5148\u5728\u7535\u8111\u4e0a\u8fd0\u884c python run_bridge.py",
         ping: "\u68c0\u6d4b",
+        debugLabel: "\u8c03\u8bd5\u5bfc\u51fa",
+        debugExport: "\u5bfc\u51fa\u8c03\u8bd5 JSON",
+        debugHint: "\u9047\u5230\u4e0d\u652f\u6301\u7684\u7ad9\u70b9\u65f6\uff0c\u53ef\u5bfc\u51fa\u5f53\u524d\u9875\u9762\u7684\u5019\u9009\u89c6\u9891\u6e90\u4fe1\u606f\u7ed9\u6211\u7ee7\u7eed\u9002\u914d\u3002",
         deviceLabel: "\u7535\u89c6",
         deviceHint: "\u7535\u8111\u548c\u7535\u89c6\u9700\u5728\u540c\u4e00\u5c40\u57df\u7f51",
         scan: "\u626b\u63cf\u7535\u89c6",
@@ -55,7 +59,9 @@
     const DEFAULT_BRIDGE_URL = "http://127.0.0.1:9527";
     const DEFAULT_QUALITY = "max";
     const DEFAULT_MODE = "standard";
-    const MEDIA_HINTS = [".m3u8", ".mp4", ".m4v", ".mov", ".webm", ".mpd", ".flv", ".mkv", ".avi", ".wmv", ".ts"];
+    const UI_TOGGLE_ID = "tm-cast-toggle";
+    const UI_PANEL_ID = "tm-cast-panel";
+    const MEDIA_EXTENSIONS = [".m3u8", ".mp4", ".m4v", ".mov", ".webm", ".mpd", ".flv", ".mkv", ".avi", ".wmv", ".ts"];
     const MEDIA_URL_PATTERN = /https?:\/\/[^"'`\s<>()\\]+?(?:\.m3u8|\.mp4|\.m4v|\.mov|\.webm|\.mpd|\.flv|\.mkv|\.avi|\.wmv|\.ts)(?:\?[^"'`\s<>()\\]*)?/ig;
     const SPECIAL_GLOBALS = {
         bilibili: ["__playinfo__", "__INITIAL_STATE__"],
@@ -75,6 +81,14 @@
     };
 
     let elements = null;
+
+    function isTopLevelPage() {
+        try {
+            return window.top === window.self;
+        } catch (error) {
+            return false;
+        }
+    }
 
     function normalizeBridgeBaseUrl(value) {
         const text = String(value || "").trim();
@@ -129,12 +143,42 @@
         return /^https?:\/\//i.test(String(value || "").trim());
     }
 
-    function looksLikePlayableMediaUrl(url) {
+    function getPlayableUrlKind(url) {
         if (!isHttpUrl(url)) {
-            return false;
+            return "";
         }
-        const lowered = url.toLowerCase();
-        return MEDIA_HINTS.some((hint) => lowered.includes(hint));
+
+        let pathname = "";
+        try {
+            pathname = new URL(url, location.href).pathname.toLowerCase();
+        } catch (error) {
+            pathname = String(url || "").trim().toLowerCase().split("?")[0];
+        }
+
+        if (pathname.endsWith(".m3u8")) {
+            return "hls";
+        }
+        if (pathname.endsWith(".mpd")) {
+            return "dash";
+        }
+        if (pathname.endsWith(".mp4") || pathname.endsWith(".m4v") || pathname.endsWith(".mov") || pathname.endsWith(".webm")) {
+            return "file";
+        }
+        if (pathname.endsWith(".flv") || pathname.endsWith(".mkv") || pathname.endsWith(".avi") || pathname.endsWith(".wmv")) {
+            return "container";
+        }
+        if (pathname.endsWith(".ts")) {
+            return "segment";
+        }
+        return "";
+    }
+
+    function looksLikePlayableMediaUrl(url) {
+        return Boolean(getPlayableUrlKind(url));
+    }
+
+    function isBlobUrl(value) {
+        return /^blob:/i.test(String(value || "").trim());
     }
 
     function toAbsoluteUrl(value) {
@@ -172,7 +216,10 @@
             return "";
         }
         if (candidate.sourceType === "page") {
-            return "\u5f53\u524d\u9875\u9762\u89e3\u6790\uff08\u63a8\u8350\uff09";
+            if (pageParsePreferredHost(location.hostname)) {
+                return "\u5f53\u524d\u9875\u9762\u89e3\u6790\uff08\u53d7\u652f\u6301\u7ad9\u70b9\u63a8\u8350\uff09";
+            }
+            return "\u5f53\u524d\u9875\u9762\u89e3\u6790\uff08\u4ec5\u53d7\u652f\u6301\u7ad9\u70b9\uff09";
         }
 
         const sourceNames = {
@@ -189,7 +236,15 @@
 
         const prefix = sourceNames[candidate.sourceType] || "\u81ea\u52a8\u8bc6\u522b";
         const suffix = shortenLabel(getReadableName(candidate.url) || candidate.displayName || candidate.label, 34);
-        return `${prefix} \u00b7 ${suffix}`;
+        const kind = getPlayableUrlKind(candidate.url);
+        const kindLabel = {
+            hls: "HLS",
+            dash: "DASH",
+            file: "MP4/WebM",
+            container: "\u5a92\u4f53\u6587\u4ef6",
+            segment: "TS \u5206\u7247",
+        }[kind] || "\u89c6\u9891\u6e90";
+        return `${prefix} \u00b7 ${suffix} \u00b7 ${kindLabel}`;
     }
 
     function rememberBridgeUrl(value) {
@@ -330,9 +385,12 @@
             "Downloading streams and preparing a compatible MP4...": "\u6b63\u5728\u51c6\u5907\u53ef\u64ad\u653e\u7684\u89c6\u9891\u6587\u4ef6...",
             "Downloading streams and applying local quality optimization...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u5e76\u505a\u672c\u5730\u753b\u8d28\u4f18\u5316...",
             "Downloading streams and rendering smoother 60fps playback...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u5e76\u751f\u6210\u66f4\u6d41\u7545\u7684 60fps \u7248\u672c...",
+            "Downloading streams and rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u7248\u672c...",
+            "60fps hardware encoding unavailable. Falling back to local quality optimization...": "60fps \u786c\u4ef6\u7f16\u7801\u4e0d\u53ef\u7528\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u4e3a\u753b\u8d28\u4f18\u5316\u3002",
             "Preparing media URL for the TV...": "\u6b63\u5728\u51c6\u5907\u6295\u5c4f\u94fe\u63a5...",
             "Applying local quality optimization...": "\u6b63\u5728\u505a\u672c\u5730\u753b\u8d28\u4f18\u5316...",
             "Rendering smoother 60fps playback...": "\u6b63\u5728\u751f\u6210\u66f4\u6d41\u7545\u7684 60fps \u64ad\u653e\u7248\u672c...",
+            "Rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u64ad\u653e\u7248\u672c...",
             "Sending playback command to the TV...": "\u6b63\u5728\u628a\u64ad\u653e\u6307\u4ee4\u53d1\u9001\u5230\u7535\u89c6...",
             "Task not found": "\u672a\u627e\u5230\u6295\u5c4f\u4efb\u52a1\u3002",
             "Not found": "\u8bf7\u6c42\u63a5\u53e3\u4e0d\u5b58\u5728\u3002",
@@ -420,6 +478,39 @@
             }
             return left.label.localeCompare(right.label);
         });
+    }
+
+    function pageParsePreferredHost(hostname) {
+        const host = String(hostname || "").toLowerCase();
+        return host.endsWith("bilibili.com") || host.endsWith("qq.com") || host.endsWith("v.qq.com");
+    }
+
+    function isDirectPlayableCandidate(candidate) {
+        if (!candidate || candidate.sourceType === "page") {
+            return false;
+        }
+        const kind = getPlayableUrlKind(candidate.url);
+        return kind === "hls" || kind === "dash" || kind === "file";
+    }
+
+    function hasBlobVideoElement() {
+        return Array.from(document.querySelectorAll("video")).some((video) => {
+            return isBlobUrl(video.currentSrc) || isBlobUrl(video.src);
+        });
+    }
+
+    function pickDefaultCandidate(candidates) {
+        if (!candidates.length) {
+            return null;
+        }
+
+        const directManifestOrFile = candidates.find((candidate) => isDirectPlayableCandidate(candidate));
+        const pageCandidate = candidates.find((candidate) => candidate.sourceType === "page") || null;
+
+        if (!pageParsePreferredHost(location.hostname) && directManifestOrFile) {
+            return directManifestOrFile;
+        }
+        return pageCandidate || directManifestOrFile || candidates[0];
     }
 
     function extractUrlsFromObject(root, labelPrefix, sourceType, priority) {
@@ -588,12 +679,15 @@
         }
         const candidates = sortCandidates(Array.from(STATE.candidateMap.values()));
         const directCount = candidates.filter((candidate) => candidate.sourceType !== "page").length;
+        const directPlayableCount = candidates.filter((candidate) => isDirectPlayableCandidate(candidate)).length;
+        const defaultCandidate = previousValue ? null : pickDefaultCandidate(candidates);
+        const blobVideoOnly = hasBlobVideoElement();
         elements.sourceSelect.innerHTML = "";
         candidates.forEach((candidate, index) => {
             const option = document.createElement("option");
             option.value = candidate.url;
             option.textContent = formatCandidateLabel(candidate);
-            if (candidate.url === previousValue || (!previousValue && index === 0)) {
+            if (candidate.url === previousValue || (!previousValue && defaultCandidate && candidate.url === defaultCandidate.url) || (!previousValue && !defaultCandidate && index === 0)) {
                 option.selected = true;
             }
             elements.sourceSelect.appendChild(option);
@@ -601,7 +695,15 @@
         if (!candidates.length) {
             elements.sourceHint.textContent = "\u8fd8\u6ca1\u8bc6\u522b\u5230\u76f4\u63a5\u89c6\u9891\u6e90\uff0c\u53ef\u5148\u5c1d\u8bd5\u9875\u9762\u89e3\u6790\uff0c\u6216\u5728\u9ad8\u7ea7\u8bbe\u7f6e\u91cc\u624b\u52a8\u7c98\u8d34\u94fe\u63a5\u3002";
         } else if (!directCount && candidates[0].sourceType === "page") {
-            elements.sourceHint.textContent = "\u5df2\u51c6\u5907\u597d\u5f53\u524d\u9875\u9762\u89e3\u6790\u6e90\uff0c\u901a\u5e38\u53ef\u4ee5\u76f4\u63a5\u5f00\u59cb\u6295\u5c4f\u3002";
+            if (blobVideoOnly) {
+                elements.sourceHint.textContent = "\u5f53\u524d\u9875\u9762\u64ad\u653e\u5668\u663e\u793a\u4e3a blob \u5730\u5740\uff0c\u8bf4\u660e\u771f\u5b9e\u89c6\u9891\u6d41\u8fd8\u6ca1\u88ab\u6293\u5230\u3002\u201c\u5f53\u524d\u9875\u9762\u89e3\u6790\u201d\u53ea\u9002\u7528\u4e8e\u5c11\u6570\u53d7\u652f\u6301\u7ad9\u70b9\uff0c\u8fd9\u79cd\u60c5\u51b5\u5f80\u5f80\u9700\u8981\u4e13\u9879\u9002\u914d\u3002";
+            } else {
+                elements.sourceHint.textContent = "\u5f53\u524d\u53ea\u5269\u201c\u5f53\u524d\u9875\u9762\u89e3\u6790\u201d\u53ef\u7528\u3002\u5b83\u53ea\u9002\u7528\u4e8e\u53d7\u652f\u6301\u7684\u64ad\u653e\u9875\uff0c\u5982\u679c\u5931\u8d25\uff0c\u8bf7\u6539\u7528\u76f4\u94fe\u6216\u624b\u52a8\u94fe\u63a5\u3002";
+            }
+        } else if (defaultCandidate && defaultCandidate.sourceType !== "page" && !pageParsePreferredHost(location.hostname)) {
+            elements.sourceHint.textContent = "\u5df2\u8bc6\u522b\u5230\u53ef\u76f4\u63a5\u6295\u5c4f\u7684\u89c6\u9891\u6d41\uff0c\u5df2\u81ea\u52a8\u4f18\u5148\u9009\u62e9\u5b83\u3002\u201c\u5f53\u524d\u9875\u9762\u89e3\u6790\u201d\u53ea\u9002\u7528\u4e8e\u5c11\u6570\u53d7\u652f\u6301\u7ad9\u70b9\u3002";
+        } else if (directPlayableCount > 0) {
+            elements.sourceHint.textContent = `\u5df2\u8bc6\u522b\u5230 ${directPlayableCount} \u4e2a\u53ef\u76f4\u63a5\u6295\u5c4f\u7684\u89c6\u9891\u6e90\u3002\u4f18\u5148\u9009 HLS / DASH / MP4 \u76f4\u94fe\uff0c\u201c\u5f53\u524d\u9875\u9762\u89e3\u6790\u201d\u53ea\u9002\u7528\u4e8e\u53d7\u652f\u6301\u7ad9\u70b9\u3002`;
         } else {
             elements.sourceHint.textContent = `\u989d\u5916\u8bc6\u522b\u5230 ${directCount} \u4e2a\u89c6\u9891\u6e90\uff0c\u4f18\u5148\u4f7f\u7528\u201c\u5f53\u524d\u9875\u9762\u89e3\u6790\uff08\u63a8\u8350\uff09\u201d\u3002`;
         }
@@ -627,6 +729,85 @@
         STATE.refreshTimer = window.setTimeout(collectCandidates, 250);
     }
 
+    function listVideoElements() {
+        return Array.from(document.querySelectorAll("video")).map((video, index) => ({
+            index: index + 1,
+            currentSrc: String(video.currentSrc || "").trim(),
+            src: String(video.src || "").trim(),
+            poster: String(video.poster || "").trim(),
+            sourceUrls: Array.from(video.querySelectorAll("source"))
+                .map((source) => String(source.src || "").trim())
+                .filter(Boolean),
+        }));
+    }
+
+    function buildDebugPayload() {
+        const candidates = sortCandidates(Array.from(STATE.candidateMap.values())).map((candidate) => ({
+            url: candidate.url,
+            label: candidate.label,
+            sourceType: candidate.sourceType,
+            displayName: candidate.displayName,
+            priority: candidate.priority,
+        }));
+        const networkCandidates = sortCandidates(Array.from(STATE.networkCandidates.values())).map((candidate) => ({
+            url: candidate.url,
+            label: candidate.label,
+            sourceType: candidate.sourceType,
+            priority: candidate.priority,
+        }));
+        return {
+            exportedAt: new Date().toISOString(),
+            page: {
+                url: location.href,
+                title: document.title,
+                host: location.hostname,
+                referrer: document.referrer || "",
+            },
+            bridge: {
+                baseUrl: STATE.bridgeBaseUrl,
+                qualityPreference: STATE.qualityPreference,
+                transcodeProfile: STATE.transcodeProfile,
+            },
+            selection: {
+                selectedSourceUrl: elements ? elements.sourceSelect.value : "",
+                selectedDeviceLocation: elements ? elements.deviceSelect.value : "",
+                manualInput: elements ? elements.manualInput.value.trim() : "",
+            },
+            counts: {
+                candidates: candidates.length,
+                networkCandidates: networkCandidates.length,
+                videoElements: document.querySelectorAll("video").length,
+            },
+            candidates,
+            networkCandidates,
+            videoElements: listVideoElements(),
+            userAgent: navigator.userAgent,
+        };
+    }
+
+    function downloadTextFile(filename, content) {
+        const blob = new Blob([content], { type: "application/json;charset=utf-8" });
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    }
+
+    function exportDebugData() {
+        collectCandidates();
+        const payload = buildDebugPayload();
+        const content = JSON.stringify(payload, null, 2);
+        const safeHost = location.hostname.replace(/[^a-z0-9.-]+/gi, "_") || "page";
+        const fileName = `screen-casting-debug-${safeHost}-${Date.now()}.json`;
+        console.log("[Screen Casting Debug]", payload);
+        downloadTextFile(fileName, content);
+        setStatus(`\u8c03\u8bd5\u4fe1\u606f\u5df2\u5bfc\u51fa\uff1a${fileName}`, "success");
+    }
+
     async function checkBridge() {
         rememberBridgeUrl(elements.bridgeInput.value);
         setStatus("\u6b63\u5728\u68c0\u6d4b\u672c\u5730 Bridge...", "neutral");
@@ -646,7 +827,7 @@
         const selectedLocation = elements.deviceSelect.value;
         setStatus("\u6b63\u5728\u626b\u63cf\u5c40\u57df\u7f51\u4e2d\u7684\u7535\u89c6...", "neutral");
         try {
-            const payload = await requestBridge("GET", "/api/devices?timeout=5.5");
+            const payload = await requestBridge("GET", "/api/devices?timeout=5.5", null, 22000);
             STATE.devices = Array.isArray(payload.devices) ? payload.devices : [];
             renderDeviceOptions(selectedLocation);
             if (STATE.devices.length) {
@@ -768,6 +949,10 @@
 
     function createUi() {
         if (STATE.uiReady || !document.body) {
+            return;
+        }
+        if (document.getElementById(UI_TOGGLE_ID) || document.getElementById(UI_PANEL_ID)) {
+            STATE.uiReady = true;
             return;
         }
         STATE.uiReady = true;
@@ -1068,13 +1253,13 @@
         `);
 
         const toggle = document.createElement("button");
-        toggle.id = "tm-cast-toggle";
+        toggle.id = UI_TOGGLE_ID;
         toggle.type = "button";
         toggle.textContent = TEXT.toggle;
         toggle.setAttribute("aria-label", TEXT.title);
 
         const panel = document.createElement("aside");
-        panel.id = "tm-cast-panel";
+        panel.id = UI_PANEL_ID;
         panel.setAttribute("data-open", "false");
         panel.setAttribute("role", "dialog");
         panel.setAttribute("aria-label", TEXT.title);
@@ -1158,6 +1343,13 @@
                         </div>
                         <div class="tm-subtle">${TEXT.manualHint}</div>
                     </div>
+                    <div class="tm-advanced-item">
+                        <label>${TEXT.debugLabel}</label>
+                        <div class="tm-row">
+                            <button id="tm-cast-export-debug" class="tm-muted" type="button">${TEXT.debugExport}</button>
+                        </div>
+                        <div class="tm-subtle">${TEXT.debugHint}</div>
+                    </div>
                 </div>
             </details>
         `;
@@ -1182,6 +1374,7 @@
             refreshButton: panel.querySelector("#tm-cast-refresh"),
             startButton: panel.querySelector("#tm-cast-start"),
             stopButton: panel.querySelector("#tm-cast-stop"),
+            exportDebugButton: panel.querySelector("#tm-cast-export-debug"),
         };
 
         elements.bridgeInput.value = STATE.bridgeBaseUrl;
@@ -1202,6 +1395,7 @@
         elements.refreshButton.addEventListener("click", collectCandidates);
         elements.startButton.addEventListener("click", castSelectedSource);
         elements.stopButton.addEventListener("click", stopCasting);
+        elements.exportDebugButton.addEventListener("click", exportDebugData);
         elements.bridgeInput.addEventListener("change", () => rememberBridgeUrl(elements.bridgeInput.value));
         elements.qualitySelect.addEventListener("change", () => rememberQualityPreference(elements.qualitySelect.value));
         elements.modeSelect.addEventListener("change", () => rememberTranscodeProfile(elements.modeSelect.value));
@@ -1228,6 +1422,10 @@
             attributes: true,
             attributeFilter: ["src"],
         });
+    }
+
+    if (!isTopLevelPage()) {
+        return;
     }
 
     installRequestHooks();
