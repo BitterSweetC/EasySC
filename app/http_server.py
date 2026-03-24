@@ -1,4 +1,4 @@
-﻿import html
+import html
 from collections import OrderedDict
 from dataclasses import dataclass
 import mimetypes
@@ -37,6 +37,11 @@ class RemoteCacheEntry:
 
 def build_proxy_url(base_url: str, proxy_path: str, source_url: str) -> str:
     return f"{base_url}{proxy_path}?url={quote(source_url, safe='')}"
+
+
+def quote_path_for_url(path: str | Path) -> str:
+    parts = [quote(part) for part in Path(path).parts if part not in {"", "."}]
+    return "/".join(parts)
 
 
 def rewrite_manifest_payload(payload: bytes, source_url: str, base_url: str, proxy_path: str) -> bytes:
@@ -228,8 +233,18 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
         media_path = self.server.media_path  # type: ignore[attr-defined]
         player_path = self.server.player_path  # type: ignore[attr-defined]
         proxy_path = getattr(self.server, "proxy_path", None)
+        media_root_prefix = getattr(self.server, "media_root_prefix", None)
         if request_path == player_path:
             self._serve_player_page(send_body)
+            return
+        if media_root_prefix and request_path.startswith(media_root_prefix):
+            relative_path = unquote(request_path[len(media_root_prefix) :]).lstrip("/")
+            if not relative_path:
+                relative_path = str(getattr(self.server, "media_root_default", "") or "").strip()
+            if not relative_path:
+                self.send_error(404, "File not found")
+                return
+            self._serve_root_file(send_body, relative_path)
             return
         if media_path and request_path == media_path:
             remote_media_url = getattr(self.server, "remote_media_url", None)
@@ -249,6 +264,19 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_file(self, send_body: bool) -> None:
         file_path = Path(self.server.media_file)  # type: ignore[attr-defined]
+        self._serve_local_file(send_body, file_path)
+
+    def _serve_root_file(self, send_body: bool, relative_path: str) -> None:
+        root_dir = Path(self.server.media_root_dir).resolve()  # type: ignore[attr-defined]
+        candidate = (root_dir / Path(relative_path)).resolve()
+        try:
+            candidate.relative_to(root_dir)
+        except ValueError:
+            self.send_error(403, "Access denied")
+            return
+        self._serve_local_file(send_body, candidate)
+
+    def _serve_local_file(self, send_body: bool, file_path: Path) -> None:
         if not file_path.exists():
             self.send_error(404, "File not found")
             return
@@ -298,12 +326,16 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
         except CLIENT_DISCONNECT_ERRORS:
             return
 
-    def _forward_remote_headers(self) -> dict[str, str]:
+    def _forward_remote_headers(self, source_url: str = "") -> dict[str, str]:
         remote_headers = getattr(self.server, "remote_headers", {})
         headers = {str(name): str(value) for name, value in dict(remote_headers).items() if name and value}
+        headers.setdefault("Accept-Encoding", "identity")
+        headers["Connection"] = "close"
         range_header = self.headers.get("Range")
-        if range_header:
+        if range_header and not looks_like_manifest_url(source_url):
             headers["Range"] = range_header
+        else:
+            headers.pop("Range", None)
         return headers
 
     def _is_manifest_response(self, source_url: str, content_type: str) -> bool:
@@ -383,8 +415,8 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
 
         request = urllib.request.Request(
             source_url,
-            headers=self._forward_remote_headers(),
-            method="GET" if send_body else "HEAD",
+            headers=self._forward_remote_headers(source_url),
+            method="GET",
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
@@ -582,9 +614,55 @@ class MediaHttpServer:
         self._thread = thread
         return self._media_url
 
+    def start_hls(self, playlist_path: str, display_name: str) -> str:
+        self.stop()
+        playlist_file = Path(playlist_path).resolve()
+        root_dir = playlist_file.parent
+        relative_playlist = playlist_file.relative_to(root_dir)
+        url_root = f"/media/{quote(root_dir.name)}/"
+        url_path = f"{url_root}{quote_path_for_url(relative_playlist)}"
+        player_path = "/player"
+        proxy_path = "/proxy"
+        server = ThreadingHTTPServer(("0.0.0.0", 0), MediaRequestHandler)
+        server.media_file = str(playlist_file)  # type: ignore[attr-defined]
+        server.media_path = url_path  # type: ignore[attr-defined]
+        server.media_root_dir = str(root_dir)  # type: ignore[attr-defined]
+        server.media_root_prefix = url_root  # type: ignore[attr-defined]
+        server.media_root_default = str(relative_playlist).replace("\\", "/")  # type: ignore[attr-defined]
+        server.player_path = player_path  # type: ignore[attr-defined]
+        server.proxy_path = proxy_path  # type: ignore[attr-defined]
+        server.remote_media_url = None  # type: ignore[attr-defined]
+        server.remote_headers = {}  # type: ignore[attr-defined]
+        server.remote_cache = OrderedDict()  # type: ignore[attr-defined]
+        server.remote_cache_lock = threading.RLock()  # type: ignore[attr-defined]
+        server.remote_cache_bytes = 0  # type: ignore[attr-defined]
+        server.player_title = display_name  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        base_url = f"http://{get_local_ip()}:{server.server_address[1]}"
+        server.base_url = base_url  # type: ignore[attr-defined]
+        local_media_url = f"{base_url}{url_path}"
+        server.player_media_url = local_media_url  # type: ignore[attr-defined]
+
+        self._media_file = playlist_file
+        self._media_url = local_media_url
+        self._player_url = f"{base_url}{player_path}"
+        self._remote_source_url = None
+        self._server = server
+        self._thread = thread
+        return self._media_url
+
     def start_remote(self, media_url: str, display_name: str, headers: Optional[dict[str, str]] = None) -> str:
         self.stop()
-        media_name = Path(display_name).name.strip() or "remote-media"
+        media_name = Path(display_name).name.strip()
+        source_suffix = Path(urlsplit(media_url).path).suffix
+        if not source_suffix and looks_like_manifest_url(media_url):
+            source_suffix = ".m3u8"
+        if not media_name:
+            media_name = f"remote-media{source_suffix}" if source_suffix else "remote-media"
+        elif source_suffix and not Path(media_name).suffix:
+            media_name = f"{media_name}{source_suffix}"
         url_path = f"/media/{quote(media_name)}"
         player_path = "/player"
         proxy_path = "/proxy"
@@ -621,7 +699,10 @@ class MediaHttpServer:
         source_url: str,
         headers: Optional[dict[str, str]] = None,
     ) -> Tuple[bytes, str, Mapping[str, str], str]:
-        request = urllib.request.Request(source_url, headers=dict(headers or {}), method="GET")
+        request_headers = dict(headers or {})
+        request_headers.setdefault("Accept-Encoding", "identity")
+        request_headers["Connection"] = "close"
+        request = urllib.request.Request(source_url, headers=request_headers, method="GET")
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read()
             effective_url = response.geturl() or source_url

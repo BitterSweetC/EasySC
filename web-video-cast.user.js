@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Video Cast to TV
 // @namespace    local.screen.casting
-// @version      0.5.6
+// @version      0.5.9
 // @description  Detect web video sources and send them to a local bridge for DLNA casting
 // @match        *://*/*
 // @grant        GM_addStyle
@@ -33,14 +33,16 @@
         sourceHint: "\u4f18\u5148\u4f7f\u7528\u5f53\u524d\u9875\u9762\u89e3\u6790\u6216\u81ea\u52a8\u8bc6\u522b\u5230\u7684\u76f4\u94fe",
         qualityLabel: "\u753b\u8d28",
         qualityHint: "\u53ea\u5bf9\u652f\u6301\u591a\u6863\u753b\u8d28\u7684\u64ad\u653e\u9875\u751f\u6548\uff0c\u624b\u52a8\u76f4\u94fe\u901a\u5e38\u4e0d\u4f1a\u6539\u753b\u8d28",
-        qualityBest: "\u6700\u9ad8\u53ef\u7528",
+        qualityBest: "\u4e0d\u8bbe\u4e0a\u9650\uff08\u5b9e\u9a8c\u6027\uff09",
+        quality2160: "2160p (4K)",
+        quality1440: "1440p",
         quality1080: "1080p",
         quality720: "720p",
         modeLabel: "\u6295\u5c4f\u6a21\u5f0f",
-        modeHint: "\u539f\u6837\u542f\u52a8\u6700\u5feb\uff1b\u753b\u8d28\u4f18\u5148\u548c\u6d41\u7545 60fps \u4f1a\u5148\u5728\u672c\u5730\u91cd\u7f16\u7801\uff0c\u5f00\u59cb\u66f4\u6162",
+        modeHint: "\u539f\u6837\u542f\u52a8\u6700\u5feb\uff1b\u753b\u8d28\u4f18\u5148\u4f1a\u5148\u5728\u672c\u5730\u91cd\u7f16\u7801\uff0c\u7a33\u5b9a 30fps \u56e0\u64ad\u653e\u4e0d\u7a33\u5b9a\u5df2\u6682\u65f6\u505c\u7528",
         modeStandard: "\u539f\u6837\u4f18\u5148",
         modeQuality: "\u753b\u8d28\u4f18\u5148",
-        modeSmooth: "\u6d41\u7545 60fps",
+        modeSmooth: "\u7a33\u5b9a 30fps\uff08\u6682\u505c\u4f7f\u7528\uff09",
         refresh: "\u91cd\u65b0\u8bc6\u522b",
         manualLabel: "\u624b\u52a8\u94fe\u63a5",
         manualPlaceholder: "\u7c98\u8d34\u89c6\u9891\u76f4\u94fe\u6216\u64ad\u653e\u9875\u94fe\u63a5",
@@ -57,12 +59,14 @@
     const QUALITY_STORAGE_KEY = "screenCastingPreferredQuality";
     const MODE_STORAGE_KEY = "screenCastingTranscodeProfile";
     const DEFAULT_BRIDGE_URL = "http://127.0.0.1:9527";
-    const DEFAULT_QUALITY = "max";
+    const DEFAULT_QUALITY = "1080p";
     const DEFAULT_MODE = "standard";
+    const SMOOTH_MODE_ENABLED = false;
     const UI_TOGGLE_ID = "tm-cast-toggle";
     const UI_PANEL_ID = "tm-cast-panel";
     const MEDIA_EXTENSIONS = [".m3u8", ".mp4", ".m4v", ".mov", ".webm", ".mpd", ".flv", ".mkv", ".avi", ".wmv", ".ts"];
     const MEDIA_URL_PATTERN = /https?:\/\/[^"'`\s<>()\\]+?(?:\.m3u8|\.mp4|\.m4v|\.mov|\.webm|\.mpd|\.flv|\.mkv|\.avi|\.wmv|\.ts)(?:\?[^"'`\s<>()\\]*)?/ig;
+    const NETWORK_RESPONSE_TEXT_LIMIT = 200000;
     const SPECIAL_GLOBALS = {
         bilibili: ["__playinfo__", "__INITIAL_STATE__"],
         tencent: ["__PLAYER_CONFIG__", "__PLAYER__CONFIG__", "VIDEO_INFO", "COVER_INFO", "__NEXT_DATA__"],
@@ -97,13 +101,19 @@
 
     function normalizeQualityPreference(value) {
         const text = String(value || "").trim().toLowerCase();
+        if (text === "2160" || text === "2160p" || text === "4k") {
+            return "2160p";
+        }
+        if (text === "1440" || text === "1440p" || text === "2k") {
+            return "1440p";
+        }
         if (text === "1080" || text === "1080p") {
             return "1080p";
         }
         if (text === "720" || text === "720p") {
             return "720p";
         }
-        return "max";
+        return text === "max" ? "max" : "1080p";
     }
 
     function normalizeTranscodeProfile(value) {
@@ -111,14 +121,20 @@
         if (text === "quality" || text === "hq") {
             return "quality";
         }
-        if (text === "smooth" || text === "60fps" || text === "smooth60") {
-            return "smooth";
+        if (text === "smooth" || text === "30fps" || text === "smooth30" || text === "60fps" || text === "smooth60") {
+            return SMOOTH_MODE_ENABLED ? "smooth" : "standard";
         }
         return "standard";
     }
 
     function getQualityLabel(value) {
         const quality = normalizeQualityPreference(value);
+        if (quality === "2160p") {
+            return TEXT.quality2160;
+        }
+        if (quality === "1440p") {
+            return TEXT.quality1440;
+        }
         if (quality === "1080p") {
             return TEXT.quality1080;
         }
@@ -386,15 +402,15 @@
             "Resolving page source...": "\u6b63\u5728\u89e3\u6790\u5f53\u524d\u9875\u9762\u89c6\u9891...",
             "Locating target TV...": "\u6b63\u5728\u5b9a\u4f4d\u7535\u89c6...",
             "Downloading streams and preparing a compatible MP4...": "\u6b63\u5728\u51c6\u5907\u53ef\u64ad\u653e\u7684\u89c6\u9891\u6587\u4ef6...",
-            "Downloading streams and applying local quality optimization...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u5e76\u505a\u672c\u5730\u753b\u8d28\u4f18\u5316...",
-            "Downloading streams and rendering smoother 60fps playback...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u5e76\u751f\u6210\u66f4\u6d41\u7545\u7684 60fps \u7248\u672c...",
-            "Downloading streams and rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u7248\u672c...",
-            "60fps hardware encoding unavailable. Falling back to local quality optimization...": "60fps \u786c\u4ef6\u7f16\u7801\u4e0d\u53ef\u7528\uff0c\u5df2\u81ea\u52a8\u964d\u7ea7\u4e3a\u753b\u8d28\u4f18\u5316\u3002",
+            "Downloading streams and preparing a high-quality compatible MP4...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u51c6\u5907\u9ad8\u753b\u8d28\u53ef\u517c\u5bb9\u7248\u672c...",
+            "Downloading streams and preparing stable 30fps playback with hardware encoding...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210\u7a33\u5b9a 30fps \u7248\u672c...",
+            "Downloading streams and preparing stable 30fps playback with software encoding...": "\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\uff0c\u4f7f\u7528\u8f6f\u4ef6\u7f16\u7801\u751f\u6210\u7a33\u5b9a 30fps \u7248\u672c...",
+            "Preloading about 15 seconds of transcoded video before casting...": "\u6b63\u5728\u5148\u7f13\u5b58\u7ea6 15 \u79d2\u5df2\u8f6c\u7801\u5185\u5bb9\uff0c\u5b8c\u6210\u540e\u518d\u5f00\u59cb\u6295\u5c4f...",
             "Preparing media URL for the TV...": "\u6b63\u5728\u51c6\u5907\u6295\u5c4f\u94fe\u63a5...",
             "Preloading a few HLS segments for smoother startup...": "\u6b63\u5728\u5148\u7f13\u51b2\u524d\u51e0\u6bb5 HLS \u89c6\u9891\uff0c\u5c3d\u91cf\u51cf\u5c11\u5f00\u64ad\u540e\u5361\u987f...",
             "Applying local quality optimization...": "\u6b63\u5728\u505a\u672c\u5730\u753b\u8d28\u4f18\u5316...",
-            "Rendering smoother 60fps playback...": "\u6b63\u5728\u751f\u6210\u66f4\u6d41\u7545\u7684 60fps \u64ad\u653e\u7248\u672c...",
-            "Rendering smoother 60fps playback with hardware encoding...": "\u6b63\u5728\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210 60fps \u64ad\u653e\u7248\u672c...",
+            "Preparing stable 30fps playback with hardware encoding...": "\u6b63\u5728\u4f7f\u7528\u786c\u4ef6\u7f16\u7801\u751f\u6210\u7a33\u5b9a 30fps \u64ad\u653e\u7248\u672c...",
+            "Preparing stable 30fps playback with software encoding...": "\u6b63\u5728\u4f7f\u7528\u8f6f\u4ef6\u7f16\u7801\u751f\u6210\u7a33\u5b9a 30fps \u64ad\u653e\u7248\u672c...",
             "Sending playback command to the TV...": "\u6b63\u5728\u628a\u64ad\u653e\u6307\u4ee4\u53d1\u9001\u5230\u7535\u89c6...",
             "Task not found": "\u672a\u627e\u5230\u6295\u5c4f\u4efb\u52a1\u3002",
             "Not found": "\u8bf7\u6c42\u63a5\u53e3\u4e0d\u5b58\u5728\u3002",
@@ -517,7 +533,7 @@
         return pageCandidate || directManifestOrFile || candidates[0];
     }
 
-    function extractUrlsFromObject(root, labelPrefix, sourceType, priority) {
+    function forEachPlayableUrlInObject(root, onUrl) {
         if (!root || (typeof root !== "object" && !Array.isArray(root))) {
             return;
         }
@@ -540,7 +556,7 @@
             values.forEach((value) => {
                 if (typeof value === "string") {
                     if (looksLikePlayableMediaUrl(value)) {
-                        addCandidate(value, `${labelPrefix}: ${getReadableName(value)}`, sourceType, document.title.trim(), priority);
+                        onUrl(value);
                     }
                     return;
                 }
@@ -549,6 +565,12 @@
                 }
             });
         }
+    }
+
+    function extractUrlsFromObject(root, labelPrefix, sourceType, priority) {
+        forEachPlayableUrlInObject(root, (url) => {
+            addCandidate(url, `${labelPrefix}: ${getReadableName(url)}`, sourceType, document.title.trim(), priority);
+        });
     }
 
     function decodeInlineScriptText(text) {
@@ -921,18 +943,110 @@
         elements.startButton.disabled = !(hasDevice && hasSource);
     }
 
-    function captureNetworkCandidate(rawUrl, sourceType, priority) {
+    function captureNetworkCandidate(rawUrl, sourceType, priority, label) {
         const url = toAbsoluteUrl(rawUrl);
         if (!looksLikePlayableMediaUrl(url)) {
             return;
         }
-        STATE.networkCandidates.set(url, {
+        const nextCandidate = {
             url,
-            label: `${sourceType}: ${getReadableName(url)}`,
+            label: label || `${sourceType}: ${getReadableName(url)}`,
             sourceType,
             priority,
-        });
+        };
+        const existing = STATE.networkCandidates.get(url);
+        if (!existing || nextCandidate.priority < existing.priority) {
+            STATE.networkCandidates.set(url, nextCandidate);
+        }
         scheduleCollectCandidates();
+    }
+
+    function shouldInspectResponseBody(requestUrl, contentType) {
+        const url = String(requestUrl || "").toLowerCase();
+        const type = String(contentType || "").toLowerCase();
+        return url.includes("/api/") || type.includes("json") || type.includes("javascript") || type.startsWith("text/");
+    }
+
+    function captureNetworkPayload(payload, sourceType, priority) {
+        if (!payload) {
+            return;
+        }
+        if (typeof payload === "string") {
+            const decoded = decodeInlineScriptText(payload).trim();
+            if (!decoded || decoded.length > NETWORK_RESPONSE_TEXT_LIMIT) {
+                return;
+            }
+            if (decoded.startsWith("{") || decoded.startsWith("[")) {
+                try {
+                    const parsed = JSON.parse(decoded);
+                    forEachPlayableUrlInObject(parsed, (url) => {
+                        captureNetworkCandidate(url, sourceType, priority, `${sourceType}: ${getReadableName(url)}`);
+                    });
+                } catch (error) {
+                    // Ignore non-JSON response bodies.
+                }
+            }
+            const matches = decoded.match(MEDIA_URL_PATTERN) || [];
+            const seen = new Set();
+            matches.forEach((url) => {
+                if (seen.has(url)) {
+                    return;
+                }
+                seen.add(url);
+                captureNetworkCandidate(url, sourceType, priority, `${sourceType}: ${getReadableName(url)}`);
+            });
+            return;
+        }
+        if (typeof payload === "object") {
+            forEachPlayableUrlInObject(payload, (url) => {
+                captureNetworkCandidate(url, sourceType, priority, `${sourceType}: ${getReadableName(url)}`);
+            });
+        }
+    }
+
+    function inspectFetchResponse(requestUrl, response) {
+        if (!response || typeof response.clone !== "function" || response.status >= 400) {
+            return;
+        }
+        const contentType = response.headers && typeof response.headers.get === "function"
+            ? response.headers.get("content-type")
+            : "";
+        if (!shouldInspectResponseBody(requestUrl, contentType)) {
+            return;
+        }
+        response.clone().text().then((text) => {
+            captureNetworkPayload(text, "fetch-response", 24);
+        }).catch(() => {
+            // Ignore unreadable response bodies.
+        });
+    }
+
+    function inspectXhrResponse(xhr) {
+        const requestUrl = xhr && xhr.__tmCastRequestUrl;
+        if (!requestUrl) {
+            return;
+        }
+        let contentType = "";
+        try {
+            contentType = xhr.getResponseHeader("content-type") || "";
+        } catch (error) {
+            contentType = "";
+        }
+        if (!shouldInspectResponseBody(requestUrl, contentType)) {
+            return;
+        }
+        try {
+            if (xhr.responseType === "json") {
+                captureNetworkPayload(xhr.response, "xhr-response", 25);
+                return;
+            }
+            if (xhr.responseType && xhr.responseType !== "" && xhr.responseType !== "text") {
+                return;
+            }
+            captureNetworkPayload(xhr.responseText || "", "xhr-response", 25);
+        } catch (error) {
+            // Ignore unreadable XHR responses.
+        }
     }
 
     function installRequestHooks() {
@@ -941,12 +1055,17 @@
             const input = args[0];
             const url = typeof input === "string" ? input : input && input.url;
             captureNetworkCandidate(url, "fetch", 52);
-            return originalFetch.apply(this, args);
+            return originalFetch.apply(this, args).then((response) => {
+                inspectFetchResponse(url, response);
+                return response;
+            });
         };
 
         const originalOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+            this.__tmCastRequestUrl = url;
             captureNetworkCandidate(url, "xhr", 50);
+            this.addEventListener("loadend", () => inspectXhrResponse(this), { once: true });
             return originalOpen.call(this, method, url, ...rest);
         };
     }
@@ -1309,8 +1428,10 @@
                 <label class="tm-mini-label" for="tm-cast-quality">${TEXT.qualityLabel}</label>
                 <div class="tm-row">
                     <select id="tm-cast-quality">
-                        <option value="max">${TEXT.qualityBest}</option>
+                        <option value="2160p">${TEXT.quality2160}</option>
+                        <option value="1440p">${TEXT.quality1440}</option>
                         <option value="1080p">${TEXT.quality1080}</option>
+                        <option value="max">${TEXT.qualityBest}</option>
                         <option value="720p">${TEXT.quality720}</option>
                     </select>
                 </div>
@@ -1320,7 +1441,7 @@
                     <select id="tm-cast-mode">
                         <option value="standard">${TEXT.modeStandard}</option>
                         <option value="quality">${TEXT.modeQuality}</option>
-                        <option value="smooth">${TEXT.modeSmooth}</option>
+                        <option value="smooth" ${SMOOTH_MODE_ENABLED ? "" : "disabled"}>${TEXT.modeSmooth}</option>
                     </select>
                 </div>
                 <div class="tm-subtle">${TEXT.modeHint}</div>

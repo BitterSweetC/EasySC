@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.media_source import display_name_from_source, explain_generated_media_url, is_http_url, is_probable_direct_media_url
@@ -13,6 +13,17 @@ class VideoPageExtractionUnavailable(RuntimeError):
 
 class VideoPageExtractionError(RuntimeError):
     pass
+
+
+class _SilentYtdlpLogger:
+    def debug(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def error(self, message: str) -> None:
+        pass
 
 
 @dataclass(slots=True)
@@ -37,7 +48,7 @@ def _load_yt_dlp_module() -> Any:
         import yt_dlp  # type: ignore
     except ImportError as exc:
         raise VideoPageExtractionUnavailable(
-            "当前环境未安装 yt-dlp，无法把视频播放页自动解析成直投地址。请先在项目虚拟环境中安装 yt-dlp。"
+            "yt-dlp is not installed in the current environment, so video pages cannot be resolved automatically."
         ) from exc
     return yt_dlp
 
@@ -127,9 +138,28 @@ def _extract_headers(*nodes: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
+def _is_requested_format_unavailable(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return "requested format is not available" in message or "requested format not available" in message
+
+
+def _extract_info_with_format_retry(yt_dlp: Any, source_url: str, options: dict[str, Any]) -> Any:
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            return downloader.extract_info(source_url, download=False)
+    except Exception as exc:
+        if "format" not in options or not _is_requested_format_unavailable(exc):
+            raise
+
+    retry_options = dict(options)
+    retry_options.pop("format", None)
+    with yt_dlp.YoutubeDL(retry_options) as downloader:
+        return downloader.extract_info(source_url, download=False)
+
+
 def resolve_media_source(source_url: str) -> ResolvedMediaSource:
     if not is_http_url(source_url):
-        raise ValueError("当前只支持 http:// 或 https:// 开头的网址。")
+        raise ValueError("Only http:// and https:// URLs are supported.")
 
     generated_url_hint = explain_generated_media_url(source_url)
     if generated_url_hint:
@@ -151,23 +181,25 @@ def resolve_media_source(source_url: str) -> ResolvedMediaSource:
         "noplaylist": True,
         "extract_flat": False,
         "format": "best[acodec!=none][vcodec!=none]/best",
+        "logger": _SilentYtdlpLogger(),
     }
     try:
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(source_url, download=False)
+        info = _extract_info_with_format_retry(yt_dlp, source_url, options)
     except Exception as exc:
-        raise VideoPageExtractionError(f"解析视频播放页失败：{exc}") from exc
+        raise VideoPageExtractionError(f"Failed to resolve video page: {exc}") from exc
 
     if not isinstance(info, dict):
-        raise VideoPageExtractionError("解析结果无效，未找到可投送的视频信息。")
+        raise VideoPageExtractionError("The extractor result is invalid.")
 
     media_node = _pick_best_media_node(info)
     if media_node is None:
-        raise VideoPageExtractionError("未能从当前播放页解析出可直接投送的视频地址。可能是站点加密、DRM 限制，或该页面没有暴露真实视频流。")
+        raise VideoPageExtractionError(
+            "No directly playable media URL was found on the current page. The site may require DRM or only expose protected streams."
+        )
 
     media_url = str(media_node.get("url") or "").strip()
     if not is_http_url(media_url):
-        raise VideoPageExtractionError("解析成功，但没有得到可用于电视播放的网络视频地址。")
+        raise VideoPageExtractionError("The extractor returned no usable network media URL.")
 
     display_name = str(media_node.get("title") or info.get("title") or display_name_from_source(source_url)).strip() or display_name_from_source(source_url)
     headers = _extract_headers(info, media_node)

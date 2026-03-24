@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -31,6 +33,16 @@ DEFAULT_DISCOVERY_TIMEOUT = 5.5
 PROJECT_ROOT = Path(__file__).resolve().parent
 REMOTE_MUX_CACHE_DIR = PROJECT_ROOT / "cache" / "compat_media" / "remote_mux"
 REMOTE_TRANSCODE_CACHE_DIR = PROJECT_ROOT / "cache" / "compat_media" / "remote_transcode"
+LIVE_TRANSCODE_CACHE_DIR = PROJECT_ROOT / "cache" / "compat_media" / "live_transcode"
+LIVE_TRANSCODE_SEGMENT_SECONDS = 2
+LIVE_TRANSCODE_STARTUP_TIMEOUT = 30.0
+LIVE_TRANSCODE_STARTUP_BUFFER_SECONDS = 15.0
+LIVE_HLS_FLAGS = "append_list+omit_endlist"
+SMOOTH_TARGET_FPS = "30000/1001"
+SMOOTH_MAX_WIDTH = 1280
+SMOOTH_MAX_HEIGHT = 720
+SMOOTH_SOFTWARE_MAX_WIDTH = 960
+SMOOTH_SOFTWARE_MAX_HEIGHT = 540
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 QUALITY_ALIASES = {
     "": "max",
@@ -39,6 +51,12 @@ QUALITY_ALIASES = {
     "highest": "max",
     "source": "max",
     "original": "max",
+    "2160": "2160p",
+    "2160p": "2160p",
+    "4k": "2160p",
+    "1440": "1440p",
+    "1440p": "1440p",
+    "2k": "1440p",
     "1080": "1080p",
     "1080p": "1080p",
     "720": "720p",
@@ -46,6 +64,8 @@ QUALITY_ALIASES = {
 }
 QUALITY_MAX_HEIGHTS = {
     "max": None,
+    "2160p": 2160,
+    "1440p": 1440,
     "1080p": 1080,
     "720p": 720,
 }
@@ -57,10 +77,16 @@ TRANSCODE_PROFILE_ALIASES = {
     "quality": "quality",
     "hq": "quality",
     "smooth": "smooth",
+    "smooth30": "smooth",
+    "30fps": "smooth",
     "smooth60": "smooth",
     "60fps": "smooth",
     "fps60": "smooth",
 }
+MUX_AWARE_PAGE_HOST_SUFFIXES = (
+    "bilibili.com",
+    "qq.com",
+)
 
 
 @dataclass(slots=True)
@@ -97,11 +123,132 @@ class TranscodeAttempt:
     hardware: bool = False
 
 
+def _format_transcode_attempt_label(attempt: TranscodeAttempt) -> str:
+    label = f"{attempt.effective_profile}/{attempt.encoder_name}"
+    if attempt.smooth_fallback:
+        label = f"{label} fallback"
+    if attempt.downgraded:
+        label = f"{label} downgraded"
+    return label
+
+
 class CastStartError(RuntimeError):
     def __init__(self, message: str, *, served_media_url: str = "", player_url: str = "") -> None:
         super().__init__(message)
         self.served_media_url = served_media_url
         self.player_url = player_url
+
+
+class LiveHlsTranscodeSession:
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        playlist_path: Path,
+        process: subprocess.Popen[Any],
+        proxy_servers: list[MediaHttpServer],
+    ) -> None:
+        self.output_dir = output_dir
+        self.playlist_path = playlist_path
+        self.process = process
+        self.proxy_servers = proxy_servers
+        self._stderr_lines: deque[str] = deque(maxlen=40)
+        self._stopped = False
+        self._stderr_thread = threading.Thread(target=self._capture_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _capture_stderr(self) -> None:
+        stderr = self.process.stderr
+        if stderr is None:
+            return
+        try:
+            for line in stderr:
+                text = str(line).strip()
+                if text:
+                    self._stderr_lines.append(text)
+        finally:
+            try:
+                stderr.close()
+            except OSError:
+                pass
+
+    def _tail_stderr(self) -> str:
+        tail = "\n".join(self._stderr_lines).strip()
+        return tail or "unknown ffmpeg error"
+
+    def buffered_duration_seconds(self) -> float:
+        if not self.playlist_path.exists():
+            return 0.0
+        try:
+            text = self.playlist_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return 0.0
+
+        total = 0.0
+        for line in text.splitlines():
+            if not line.startswith("#EXTINF:"):
+                continue
+            value = line.partition(":")[2].partition(",")[0].strip()
+            try:
+                total += float(value)
+            except ValueError:
+                continue
+        if total > 0:
+            return total
+        return float(len(list(self.output_dir.glob("segment_*.ts"))) * LIVE_TRANSCODE_SEGMENT_SECONDS)
+
+    def wait_until_ready(
+        self,
+        timeout: float = LIVE_TRANSCODE_STARTUP_TIMEOUT,
+        *,
+        startup_buffer_seconds: float = LIVE_TRANSCODE_STARTUP_BUFFER_SECONDS,
+    ) -> None:
+        deadline = time.time() + max(timeout, 1.0)
+        required_buffer = max(0.0, float(startup_buffer_seconds))
+        while time.time() < deadline:
+            buffered_seconds = self.buffered_duration_seconds()
+            if self.playlist_path.exists() and buffered_seconds >= required_buffer:
+                return
+            exit_code = self.process.poll()
+            if exit_code is not None:
+                if self.playlist_path.exists() and buffered_seconds > 0:
+                    return
+                raise RuntimeError(f"ffmpeg exited with code {exit_code}.\n{self._tail_stderr()}")
+            time.sleep(0.25)
+        raise RuntimeError(
+            f"Timed out waiting for live HLS startup buffer ({buffered_seconds:.1f}s/{required_buffer:.1f}s).\n{self._tail_stderr()}"
+        )
+
+    def stop(self, cleanup: bool = True) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+            except OSError:
+                pass
+
+        stderr = self.process.stderr
+        if stderr is not None and not stderr.closed:
+            try:
+                stderr.close()
+            except OSError:
+                pass
+
+        if self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=1)
+
+        for proxy_server in self.proxy_servers:
+            proxy_server.stop()
+
+        if cleanup:
+            shutil.rmtree(self.output_dir, ignore_errors=True)
 
 
 _FFMPEG_ENCODER_LIST_CACHE: dict[str, set[str]] = {}
@@ -138,7 +285,7 @@ def build_didl_metadata_with_title(source: str, media_url: str, title: str) -> s
 
 def set_media_with_title(controller: DlnaController, media_url: str, metadata_source: str, title: str) -> bytes:
     if controller.device.av_transport is None:
-        raise ValueError("目标设备不支持 AVTransport")
+        raise ValueError("The target device does not expose AVTransport.")
     metadata = build_didl_metadata_with_title(metadata_source, media_url, title)
     return controller._post_action(  # type: ignore[attr-defined]
         controller.device.av_transport,
@@ -156,7 +303,7 @@ def _load_yt_dlp_module() -> Any:
         import yt_dlp  # type: ignore
     except ImportError as exc:
         raise VideoPageExtractionUnavailable(
-            "当前环境未安装 yt-dlp，无法把视频播放页自动解析成直投地址。请先在项目虚拟环境中安装 yt-dlp。"
+            "yt-dlp is not installed in the current environment, so page extraction is unavailable."
         ) from exc
     return yt_dlp
 
@@ -190,12 +337,21 @@ def _quality_max_height(value: Any) -> int | None:
     return QUALITY_MAX_HEIGHTS[normalize_quality_preference(value)]
 
 
+def _prefers_mux_aware_page_resolution(source_url: str) -> bool:
+    if not is_http_url(source_url) or is_probable_direct_media_url(source_url):
+        return False
+    hostname = (urlsplit(source_url).hostname or "").strip().lower()
+    if not hostname:
+        return False
+    return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in MUX_AWARE_PAGE_HOST_SUFFIXES)
+
+
 def _profile_label(value: Any) -> str:
     profile = normalize_transcode_profile(value)
     if profile == "quality":
         return "quality"
     if profile == "smooth":
-        return "smooth 60fps"
+        return "smooth 30fps"
     return "standard"
 
 
@@ -283,10 +439,9 @@ def _build_transcode_attempts(transcode_profile: str, hardware_encoder: str = ""
     if hardware_encoder:
         return [
             TranscodeAttempt(effective_profile="smooth", encoder_name=hardware_encoder, hardware=True),
-            TranscodeAttempt(effective_profile="smooth", encoder_name=hardware_encoder, smooth_fallback=True, hardware=True),
-            TranscodeAttempt(effective_profile="quality", encoder_name="libx264", downgraded=True),
+            TranscodeAttempt(effective_profile="smooth", encoder_name="libx264", smooth_fallback=True),
         ]
-    return [TranscodeAttempt(effective_profile="quality", encoder_name="libx264", downgraded=True)]
+    return [TranscodeAttempt(effective_profile="smooth", encoder_name="libx264", smooth_fallback=True)]
 
 
 def _build_quality_format_selector(value: Any) -> str:
@@ -299,6 +454,36 @@ def _build_quality_format_selector(value: Any) -> str:
         f"best[height<={max_height}]/"
         "bestvideo+bestaudio/best"
     )
+
+
+class _SilentYtdlpLogger:
+    def debug(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def error(self, message: str) -> None:
+        pass
+
+
+def _is_requested_format_unavailable(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return "requested format is not available" in message or "requested format not available" in message
+
+
+def _extract_info_with_format_retry(yt_dlp: Any, source_url: str, options: dict[str, Any]) -> Any:
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            return downloader.extract_info(source_url, download=False)
+    except Exception as exc:
+        if "format" not in options or not _is_requested_format_unavailable(exc):
+            raise
+
+    retry_options = dict(options)
+    retry_options.pop("format", None)
+    with yt_dlp.YoutubeDL(retry_options) as downloader:
+        return downloader.extract_info(source_url, download=False)
 
 
 def _candidate_height(item: Mapping[str, Any]) -> int | None:
@@ -479,15 +664,15 @@ def resolve_source_with_yt_dlp_fallback(
         "noplaylist": True,
         "extract_flat": False,
         "format": _build_quality_format_selector(quality),
+        "logger": _SilentYtdlpLogger(),
     }
     try:
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(source_url, download=False)
+        info = _extract_info_with_format_retry(yt_dlp, source_url, options)
     except Exception as exc:
-        raise VideoPageExtractionError(f"解析视频播放页失败：{exc}") from exc
+        raise VideoPageExtractionError(f"Failed to resolve video page: {exc}") from exc
 
     if not isinstance(info, dict):
-        raise VideoPageExtractionError("解析结果无效，未找到可投送的视频信息。")
+        raise VideoPageExtractionError("The extractor result is invalid.")
 
     title = str(display_name or info.get("title") or display_name_from_source(source_url)).strip() or display_name_from_source(source_url)
     merged_headers = filter_forward_headers(headers)
@@ -514,7 +699,7 @@ def resolve_source_with_yt_dlp_fallback(
 
     direct_candidate = _pick_direct_media_candidate(info, quality=quality)
     if direct_candidate is None:
-        raise VideoPageExtractionError("未能从当前播放页解析出可直接投送的单链接视频，且当前页面只暴露了分离音视频流。")
+        raise VideoPageExtractionError("No directly playable single-URL media was found on the current page, and the page only exposed separated audio/video streams.")
 
     direct_url, direct_headers = direct_candidate
     merged_headers.update(direct_headers)
@@ -526,49 +711,51 @@ def resolve_source_with_yt_dlp_fallback(
         resolved_from_page=True,
     )
 
-
-def _format_ffmpeg_headers(values: Mapping[str, Any] | None) -> str:
-    headers = filter_forward_headers(values)
-    if not headers:
-        return ""
-    return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+def _smooth_target_dimensions(*, encoder_name: str, smooth_fallback: bool) -> tuple[int, int]:
+    if encoder_name == "libx264" or smooth_fallback:
+        return SMOOTH_SOFTWARE_MAX_WIDTH, SMOOTH_SOFTWARE_MAX_HEIGHT
+    return SMOOTH_MAX_WIDTH, SMOOTH_MAX_HEIGHT
 
 
 def _build_video_filter_chain(transcode_profile: str, *, encoder_name: str = "libx264", smooth_fallback: bool = False) -> str:
     profile = normalize_transcode_profile(transcode_profile)
-    filters = ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     if profile == "smooth":
-        if smooth_fallback:
-            filters.append("fps=60000/1001")
-        else:
-            filters.append("minterpolate=fps=60000/1001:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+        max_width, max_height = _smooth_target_dimensions(
+            encoder_name=encoder_name,
+            smooth_fallback=smooth_fallback,
+        )
+        filters = [
+            (
+                f"scale=w='min({max_width},iw)':h='min({max_height},ih)':"
+                "force_original_aspect_ratio=decrease:flags=fast_bilinear"
+            ),
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ]
+        filters.append(f"fps={SMOOTH_TARGET_FPS}")
+    else:
+        filters = ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     if encoder_name in {"h264_qsv", "h264_amf"}:
         filters.append("format=nv12")
     return ",".join(filters)
 
 
-def _append_transcode_output_options(
-    command: list[str],
-    output_file: Path,
+def _transcode_profile_defaults(profile: str) -> tuple[str, str, str]:
+    if profile == "quality":
+        return "medium", "18", "192k"
+    if profile == "smooth":
+        return "superfast", "25", "96k"
+    return "veryfast", "23", "128k"
+
+
+def _build_video_output_args(
     transcode_profile: str,
     *,
     encoder_name: str = "libx264",
     smooth_fallback: bool = False,
-) -> list[str]:
+    live_hls: bool = False,
+) -> tuple[list[str], str]:
     profile = normalize_transcode_profile(transcode_profile)
-    preset = "veryfast"
-    crf = "23"
-    audio_bitrate = "128k"
-    video_args: list[str]
-
-    if profile == "quality":
-        preset = "medium"
-        crf = "18"
-        audio_bitrate = "192k"
-    elif profile == "smooth":
-        preset = "fast"
-        crf = "20"
-        audio_bitrate = "160k"
+    preset, crf, audio_bitrate = _transcode_profile_defaults(profile)
 
     if encoder_name == "libx264":
         video_args = [
@@ -583,57 +770,99 @@ def _append_transcode_output_options(
             "-pix_fmt",
             "yuv420p",
         ]
-    elif encoder_name == "h264_nvenc":
+        if live_hls and profile == "smooth":
+            video_args.extend(
+                [
+                    "-tune",
+                    "zerolatency",
+                    "-g",
+                    "60",
+                    "-keyint_min",
+                    "60",
+                    "-sc_threshold",
+                    "0",
+                ]
+            )
+        return video_args, audio_bitrate
+
+    if encoder_name == "h264_nvenc":
         cq = "21" if profile == "quality" else "23"
-        video_args = [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p5",
-            "-rc",
-            "vbr",
-            "-cq",
-            cq,
-            "-b:v",
-            "0",
-            "-vf",
-            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    elif encoder_name == "h264_qsv":
+        return (
+            [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-rc",
+                "vbr",
+                "-cq",
+                cq,
+                "-b:v",
+                "0",
+                "-vf",
+                _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+                "-pix_fmt",
+                "yuv420p",
+            ],
+            audio_bitrate,
+        )
+
+    if encoder_name == "h264_qsv":
         global_quality = "20" if profile == "quality" else "23"
-        video_args = [
-            "-c:v",
-            "h264_qsv",
-            "-global_quality",
-            global_quality,
-            "-preset",
-            "medium",
-            "-vf",
-            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
-        ]
-    elif encoder_name == "h264_amf":
+        return (
+            [
+                "-c:v",
+                "h264_qsv",
+                "-global_quality",
+                global_quality,
+                "-preset",
+                "medium",
+                "-vf",
+                _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+            ],
+            audio_bitrate,
+        )
+
+    if encoder_name == "h264_amf":
         qp_p = "20" if profile == "quality" else "23"
         qp_i = "18" if profile == "quality" else "21"
-        video_args = [
-            "-c:v",
-            "h264_amf",
-            "-usage",
-            "transcoding",
-            "-quality",
-            "quality",
-            "-rc",
-            "cqp",
-            "-qp_i",
-            qp_i,
-            "-qp_p",
-            qp_p,
-            "-vf",
-            _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
-        ]
-    else:
-        raise RuntimeError(f"Unsupported encoder: {encoder_name}")
+        return (
+            [
+                "-c:v",
+                "h264_amf",
+                "-usage",
+                "transcoding",
+                "-quality",
+                "quality",
+                "-rc",
+                "cqp",
+                "-qp_i",
+                qp_i,
+                "-qp_p",
+                qp_p,
+                "-vf",
+                _build_video_filter_chain(profile, encoder_name=encoder_name, smooth_fallback=smooth_fallback),
+            ],
+            audio_bitrate,
+        )
+
+    raise RuntimeError(f"Unsupported encoder: {encoder_name}")
+
+
+def _append_transcode_output_options(
+    command: list[str],
+    output_file: Path,
+    transcode_profile: str,
+    *,
+    encoder_name: str = "libx264",
+    smooth_fallback: bool = False,
+) -> list[str]:
+    profile = normalize_transcode_profile(transcode_profile)
+    video_args, audio_bitrate = _build_video_output_args(
+        profile,
+        encoder_name=encoder_name,
+        smooth_fallback=smooth_fallback,
+    )
 
     command.extend(
         [
@@ -654,6 +883,59 @@ def _append_transcode_output_options(
         ]
     )
     return command
+
+
+def _build_live_hls_output_command(
+    ffmpeg_path: Path,
+    input_args: list[str],
+    map_args: list[str],
+    output_dir: Path,
+    transcode_profile: str,
+    *,
+    encoder_name: str = "libx264",
+    smooth_fallback: bool = False,
+) -> tuple[list[str], Path]:
+    profile = normalize_transcode_profile(transcode_profile)
+    playlist_path = output_dir / "index.m3u8"
+    segment_pattern = output_dir / "segment_%05d.ts"
+    video_args, audio_bitrate = _build_video_output_args(
+        profile,
+        encoder_name=encoder_name,
+        smooth_fallback=smooth_fallback,
+        live_hls=True,
+    )
+
+    command = [
+        str(ffmpeg_path),
+        "-y",
+        *input_args,
+        *map_args,
+        "-map_metadata",
+        "-1",
+        "-sn",
+        "-dn",
+        *video_args,
+        "-c:a",
+        "aac",
+        "-b:a",
+        audio_bitrate,
+        "-ac",
+        "2",
+        "-f",
+        "hls",
+        "-hls_time",
+        str(LIVE_TRANSCODE_SEGMENT_SECONDS),
+        "-hls_list_size",
+        "0",
+        "-hls_playlist_type",
+        "event",
+        "-hls_flags",
+        LIVE_HLS_FLAGS,
+        "-hls_segment_filename",
+        str(segment_pattern),
+        str(playlist_path),
+    ]
+    return command, playlist_path
 
 
 def _run_transcode_command(
@@ -682,11 +964,7 @@ def _run_transcode_command(
             return output_file
 
         stderr = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
-        label = f"{attempt.effective_profile}/{attempt.encoder_name}"
-        if attempt.smooth_fallback:
-            label = f"{label} fallback"
-        if attempt.downgraded:
-            label = f"{label} downgraded"
+        label = _format_transcode_attempt_label(attempt)
         failure_sections.extend([f"{label} failed:"])
         failure_sections.extend(stderr.splitlines()[-8:])
 
@@ -698,6 +976,163 @@ def _run_transcode_command(
 
     tail = "\n".join(failure_sections[-20:])
     raise RuntimeError(f"ffmpeg failed to transcode remote media.\n{tail}")
+
+
+def _find_ffprobe_for_ffmpeg(ffmpeg_path: Path) -> Path | None:
+    candidates = [ffmpeg_path.with_name("ffprobe.exe" if ffmpeg_path.suffix.lower() == ".exe" else "ffprobe")]
+    which_value = shutil.which("ffprobe")
+    if which_value:
+        candidates.append(Path(which_value))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _probe_media_codecs(ffmpeg_path: Path, media_source: str) -> tuple[set[str], set[str]] | None:
+    ffprobe_path = _find_ffprobe_for_ffmpeg(ffmpeg_path)
+    if ffprobe_path is None:
+        return None
+
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name",
+        "-of",
+        "json",
+        media_source,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="ignore",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return None
+
+    video_codecs: set[str] = set()
+    audio_codecs: set[str] = set()
+    for item in streams:
+        if not isinstance(item, dict):
+            continue
+        codec_type = str(item.get("codec_type") or "").strip().lower()
+        codec_name = str(item.get("codec_name") or "").strip().lower()
+        if not codec_name:
+            continue
+        if codec_type == "video":
+            video_codecs.add(codec_name)
+        elif codec_type == "audio":
+            audio_codecs.add(codec_name)
+
+    if not video_codecs:
+        return None
+    return video_codecs, audio_codecs
+
+
+def _probe_remote_media_codecs(ffmpeg_path: Path, media_url: str) -> tuple[set[str], set[str]] | None:
+    return _probe_media_codecs(ffmpeg_path, media_url)
+
+
+def _is_fast_copy_mp4_compatible(video_codecs: set[str], audio_codecs: set[str]) -> bool:
+    return video_codecs == {"h264"} and audio_codecs.issubset({"aac"})
+
+
+def _run_fast_copy_mux(
+    ffmpeg_path: Path,
+    input_args: list[str],
+    map_args: list[str],
+    output_file: Path,
+    *,
+    attempt_arg_sets: list[list[str]],
+) -> Path | None:
+    for extra_args in attempt_arg_sets:
+        command = [
+            str(ffmpeg_path),
+            "-y",
+            *input_args,
+            *map_args,
+            "-map_metadata",
+            "-1",
+            "-sn",
+            "-dn",
+            *extra_args,
+            str(output_file),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, errors="ignore")
+        if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+            return output_file
+        if output_file.exists():
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def _try_fast_compatible_hls_remux(ffmpeg_path: Path, media_url: str, output_file: Path) -> Path | None:
+    codecs = _probe_remote_media_codecs(ffmpeg_path, media_url)
+    if codecs is None:
+        return None
+
+    video_codecs, audio_codecs = codecs
+    if not _is_fast_copy_mp4_compatible(video_codecs, audio_codecs):
+        return None
+
+    return _run_fast_copy_mux(
+        ffmpeg_path,
+        ["-i", media_url],
+        ["-map", "0:v:0", "-map", "0:a:0?"],
+        output_file,
+        attempt_arg_sets=[
+            ["-c:v", "copy", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart"],
+            ["-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart"],
+        ],
+    )
+
+
+def _try_fast_compatible_local_stream_mux(
+    ffmpeg_path: Path,
+    video_input: Path,
+    audio_input: Path,
+    output_file: Path,
+) -> Path | None:
+    video_probe = _probe_media_codecs(ffmpeg_path, str(video_input))
+    audio_probe = _probe_media_codecs(ffmpeg_path, str(audio_input))
+    if video_probe is None or audio_probe is None:
+        return None
+
+    video_codecs, _ = video_probe
+    _, audio_codecs = audio_probe
+    if not _is_fast_copy_mp4_compatible(video_codecs, audio_codecs):
+        return None
+
+    return _run_fast_copy_mux(
+        ffmpeg_path,
+        ["-i", str(video_input), "-i", str(audio_input)],
+        ["-map", "0:v:0", "-map", "1:a:0"],
+        output_file,
+        attempt_arg_sets=[
+            ["-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart"],
+            ["-c:v", "copy", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart"],
+        ],
+    )
 
 
 def mux_remote_streams_to_compatible_mp4(
@@ -734,38 +1169,10 @@ def mux_remote_streams_to_compatible_mp4(
     download_remote_stream(video_url, video_headers, video_input)
     download_remote_stream(audio_url, audio_headers, audio_input)
 
-    if profile == "standard":
-        fast_mux_command = [
-            str(ffmpeg_path),
-            "-y",
-            "-i",
-            str(video_input),
-            "-i",
-            str(audio_input),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-map_metadata",
-            "-1",
-            "-sn",
-            "-dn",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_file),
-        ]
-        fast_result = subprocess.run(fast_mux_command, capture_output=True, text=True, errors="ignore")
-        if fast_result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
-            return output_file
-        if output_file.exists():
-            try:
-                output_file.unlink()
-            except OSError:
-                pass
+    if profile in {"standard", "quality"}:
+        fast_muxed = _try_fast_compatible_local_stream_mux(ffmpeg_path, video_input, audio_input, output_file)
+        if fast_muxed is not None:
+            return fast_muxed
 
     return _run_transcode_command(
         ffmpeg_path,
@@ -774,6 +1181,66 @@ def mux_remote_streams_to_compatible_mp4(
         output_file,
         profile,
     )
+
+
+def _looks_like_hls_media_url(media_url: str) -> bool:
+    return ".m3u8" in str(media_url or "").lower()
+
+
+def start_live_hls_transcode_session(
+    *,
+    media_url: str,
+    display_name: str,
+    headers: Mapping[str, Any] | None = None,
+    transcode_profile: str = "quality",
+    startup_buffer_seconds: float = LIVE_TRANSCODE_STARTUP_BUFFER_SECONDS,
+) -> LiveHlsTranscodeSession:
+    ffmpeg_path = find_ffmpeg()
+    LIVE_TRANSCODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    profile = normalize_transcode_profile(transcode_profile)
+    hardware_encoder = detect_preferred_h264_hardware_encoder(ffmpeg_path) if profile == "smooth" else ""
+    attempts = _build_transcode_attempts(profile, hardware_encoder=hardware_encoder)
+    failure_sections: list[str] = []
+
+    for attempt in attempts:
+        session_dir = LIVE_TRANSCODE_CACHE_DIR / f"{_safe_output_stem(display_name)}_{attempt.effective_profile}_{uuid.uuid4().hex[:10]}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        proxy_server = MediaHttpServer()
+        proxied_media_url = proxy_server.start_remote(media_url, display_name, headers=filter_forward_headers(headers))
+        command, playlist_path = _build_live_hls_output_command(
+            ffmpeg_path,
+            ["-i", proxied_media_url],
+            ["-map", "0:v:0", "-map", "0:a:0?"],
+            session_dir,
+            attempt.effective_profile,
+            encoder_name=attempt.encoder_name,
+            smooth_fallback=attempt.smooth_fallback,
+        )
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="ignore",
+        )
+        session = LiveHlsTranscodeSession(
+            output_dir=session_dir,
+            playlist_path=playlist_path,
+            process=process,
+            proxy_servers=[proxy_server],
+        )
+        try:
+            session.wait_until_ready(startup_buffer_seconds=startup_buffer_seconds)
+            return session
+        except RuntimeError as exc:
+            label = _format_transcode_attempt_label(attempt)
+            failure_sections.extend([f"{label} failed:"])
+            failure_sections.extend(str(exc).splitlines()[-8:])
+            session.stop()
+
+    tail = "\n".join(failure_sections[-20:])
+    raise RuntimeError(f"ffmpeg failed to start live HLS transcode.\n{tail}")
 
 
 def transcode_remote_media_to_compatible_mp4(
@@ -792,19 +1259,22 @@ def transcode_remote_media_to_compatible_mp4(
     if output_file.exists() and output_file.stat().st_size > 0:
         return output_file
 
-    input_args: list[str] = []
-    header_blob = _format_ffmpeg_headers(headers)
-    if header_blob:
-        input_args.extend(["-headers", header_blob])
-    input_args.extend(["-i", media_url])
-
-    return _run_transcode_command(
-        ffmpeg_path,
-        input_args,
-        ["-map", "0:v:0", "-map", "0:a:0?"],
-        output_file,
-        profile,
-    )
+    proxy_server = MediaHttpServer()
+    proxied_media_url = proxy_server.start_remote(media_url, display_name, headers=filter_forward_headers(headers))
+    try:
+        if profile == "quality" and _looks_like_hls_media_url(media_url):
+            fast_remuxed = _try_fast_compatible_hls_remux(ffmpeg_path, proxied_media_url, output_file)
+            if fast_remuxed is not None:
+                return fast_remuxed
+        return _run_transcode_command(
+            ffmpeg_path,
+            ["-i", proxied_media_url],
+            ["-map", "0:v:0", "-map", "0:a:0?"],
+            output_file,
+            profile,
+        )
+    finally:
+        proxy_server.stop()
 
 
 class TampermonkeyBridgeService:
@@ -816,6 +1286,7 @@ class TampermonkeyBridgeService:
         self._tasks: dict[str, BridgeTask] = {}
         self.current_controller: DlnaController | None = None
         self.current_device: DlnaDevice | None = None
+        self.current_live_transcode_session: LiveHlsTranscodeSession | None = None
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -852,6 +1323,17 @@ class TampermonkeyBridgeService:
                 headers=headers,
                 quality=quality,
             )
+
+        if _prefers_mux_aware_page_resolution(source_url):
+            try:
+                return resolve_source_with_yt_dlp_fallback(
+                    source_url,
+                    display_name=display_name,
+                    headers=headers,
+                    quality=quality,
+                )
+            except VideoPageExtractionError:
+                pass
 
         try:
             resolved = resolve_media_source(source_url)
@@ -987,11 +1469,14 @@ class TampermonkeyBridgeService:
         served_media_url = ""
         player_url = ""
         metadata_source = resolved.media_url
+        live_transcode_session: LiveHlsTranscodeSession | None = None
 
         with self._lock:
             previous_controller = self.current_controller
+            previous_live_transcode_session = self.current_live_transcode_session
             self.current_controller = None
             self.current_device = None
+            self.current_live_transcode_session = None
 
         with self._playback_lock:
             if previous_controller is not None:
@@ -999,16 +1484,18 @@ class TampermonkeyBridgeService:
                     previous_controller.stop()
                 except (ValueError, HTTPError, URLError, OSError):
                     pass
+            if previous_live_transcode_session is not None:
+                previous_live_transcode_session.stop()
 
             if resolved.requires_local_mux:
                 if profile == "standard":
                     progress_message = "Downloading streams and preparing a compatible MP4..."
                 elif profile == "quality":
-                    progress_message = "Downloading streams and applying local quality optimization..."
+                    progress_message = "Downloading streams and preparing a high-quality compatible MP4..."
                 elif smooth_hardware_encoder:
-                    progress_message = "Downloading streams and rendering smoother 60fps playback with hardware encoding..."
+                    progress_message = "Downloading streams and preparing stable 30fps playback with hardware encoding..."
                 else:
-                    progress_message = "60fps hardware encoding unavailable. Falling back to local quality optimization..."
+                    progress_message = "Downloading streams and preparing stable 30fps playback with software encoding..."
                 self._notify_progress(progress_callback, "muxing", progress_message)
                 muxed_file = mux_remote_streams_to_compatible_mp4(
                     video_url=resolved.video_url,
@@ -1024,18 +1511,36 @@ class TampermonkeyBridgeService:
                 if profile == "quality":
                     progress_message = "Applying local quality optimization..."
                 elif smooth_hardware_encoder:
-                    progress_message = "Rendering smoother 60fps playback with hardware encoding..."
+                    progress_message = "Preparing stable 30fps playback with hardware encoding..."
                 else:
-                    progress_message = "60fps hardware encoding unavailable. Falling back to local quality optimization..."
+                    progress_message = "Preparing stable 30fps playback with software encoding..."
                 self._notify_progress(progress_callback, "transcoding", progress_message)
-                transcoded_file = transcode_remote_media_to_compatible_mp4(
-                    media_url=resolved.media_url,
-                    display_name=resolved.display_name,
-                    headers=resolved.headers,
-                    transcode_profile=profile,
-                )
-                served_media_url = self.http_server.start(str(transcoded_file))
-                metadata_source = str(transcoded_file)
+                if profile == "smooth" and _looks_like_hls_media_url(resolved.media_url):
+                    self._notify_progress(
+                        progress_callback,
+                        "preloading",
+                        f"Preloading about {int(LIVE_TRANSCODE_STARTUP_BUFFER_SECONDS)} seconds of transcoded video before casting...",
+                    )
+                    live_transcode_session = start_live_hls_transcode_session(
+                        media_url=resolved.media_url,
+                        display_name=resolved.display_name,
+                        headers=resolved.headers,
+                        transcode_profile=profile,
+                        startup_buffer_seconds=LIVE_TRANSCODE_STARTUP_BUFFER_SECONDS,
+                    )
+                    served_media_url = self.http_server.start_hls(str(live_transcode_session.playlist_path), resolved.display_name)
+                    metadata_source = str(live_transcode_session.playlist_path)
+                    with self._lock:
+                        self.current_live_transcode_session = live_transcode_session
+                else:
+                    transcoded_file = transcode_remote_media_to_compatible_mp4(
+                        media_url=resolved.media_url,
+                        display_name=resolved.display_name,
+                        headers=resolved.headers,
+                        transcode_profile=profile,
+                    )
+                    served_media_url = self.http_server.start(str(transcoded_file))
+                    metadata_source = str(transcoded_file)
             else:
                 self._notify_progress(progress_callback, "serving", "Preparing media URL for the TV...")
                 if ".m3u8" in str(resolved.media_url or "").lower():
@@ -1110,15 +1615,20 @@ class TampermonkeyBridgeService:
         with self._playback_lock:
             with self._lock:
                 controller = self.current_controller
+                live_transcode_session = self.current_live_transcode_session
                 device_name = self.current_device.display_name if self.current_device else ""
                 self.current_controller = None
                 self.current_device = None
+                self.current_live_transcode_session = None
 
             if controller is not None:
                 try:
                     controller.stop()
                 except (ValueError, HTTPError, URLError, OSError):
                     pass
+
+            if live_transcode_session is not None:
+                live_transcode_session.stop()
 
             self.http_server.stop()
         return {
@@ -1133,7 +1643,7 @@ class TampermonkeyBridgeService:
     def _find_device(self, device_location: str, *, discovery_timeout: float) -> DlnaDevice:
         location = device_location.strip()
         if not location:
-            raise ValueError("缺少设备地址，请先扫描并选择电视。")
+            raise ValueError("Device location is required. Scan devices and select a TV first.")
 
         with self._lock:
             cached = self._devices_by_location.get(location)
@@ -1145,7 +1655,7 @@ class TampermonkeyBridgeService:
             self._devices_by_location = {device.location: device for device in devices}
             cached = self._devices_by_location.get(location)
         if cached is None:
-            raise ValueError("未找到指定电视，请先在油猴面板里重新扫描设备。")
+            raise ValueError("The selected TV was not found. Rescan devices in the Tampermonkey panel and try again.")
         return cached
 
     def _serialize_device(self, device: DlnaDevice) -> dict[str, Any]:
@@ -1373,9 +1883,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            raise ValueError(f"JSON 解析失败：{exc.msg}") from exc
+            raise ValueError(f"JSON parse failed: {exc.msg}") from exc
         if not isinstance(payload, dict):
-            raise ValueError("请求体必须是 JSON 对象。")
+            raise ValueError("Request body must be a JSON object.")
         return payload
 
     def _float_query_value(self, query: str, name: str, default: float) -> float:
@@ -1396,7 +1906,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>油猴投屏桥接服务</title>
+  <title>婵炲苯婀辩亸銊╁箮閺囩偟娼屾俊妞煎劜鐢挳寮靛鍛潳</title>
   <style>
     body {
       margin: 0;
@@ -1431,17 +1941,17 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 </head>
 <body>
   <main class="shell">
-    <h1>油猴投屏桥接服务已启动</h1>
+    <h1>婵炲苯婀辩亸銊╁箮閺囩偟娼屾俊妞煎劜鐢挳寮靛鍛潳鐎瑰憡褰冮幆搴ㄥ礉?/h1>
     <div class="card">
-      <p>这个本地服务供油猴脚本调用，用来扫描电视、解析网页视频地址并通过 DLNA 投送到电视。</p>
-      <p>健康检查：<code>/api/health</code></p>
-      <p>扫描设备：<code>/api/devices</code></p>
-      <p>解析视频：<code>POST /api/resolve</code></p>
-      <p>开始投屏：<code>POST /api/cast</code></p>
-      <p>停止投屏：<code>POST /api/stop</code></p>
+      <p>閺夆晜鐟ら柌婊堝嫉椤掆偓濠€鎾嫉瀹ュ懎顫ゅ〒姘⊕鐞涖儵鎮壕瀣闁哄牜鍓濋惃鐔兼偨椤帞绀夐柣顫妽濞肩敻骞嶉锝呬紟闁活澀绲婚～瀣Υ娴ｅ彨鎺楀几閹邦喚绉瑰銈勭祷椤锛愰幋婵囧嬀闁秆€鍋撴鐐茬埣閳ь剚淇虹换?DLNA 闁硅埖娲熼埀顑跨閸╁矂鎮芥担鍐炬綊闁?/p>
+      <p>闁稿鍎遍幃宥呂涢埀顒勫蓟閵夘垳绐?code>/api/health</code></p>
+      <p>闁规鍋呭璺ㄦ媼閹屾У闁?code>/api/devices</code></p>
+      <p>閻熸瑱绲鹃悗鐣屾喆閸℃侗鏆ラ柨?code>POST /api/resolve</code></p>
+      <p>鐎殿喒鍋撳┑顔碱儐婵洨浠﹁箛銉х獥<code>POST /api/cast</code></p>
+      <p>闁稿绮嶉娑㈠箮閺囩偟娼岄柨?code>POST /api/stop</code></p>
     </div>
     <div class="card">
-      <p>如果油猴脚本连不上，请确认脚本里配置的桥接地址和当前端口一致。</p>
+      <p>濠碘€冲€归悘澶娾柦閸︻厼鐨戦柤瀛樼濠€鐗堟交閻愭壆鐟濆☉鎾愁煭缁辨繄鎷犳搴樷偓妯兼媼閵堝牆澹栭柡鍫墴閸ｇ兘鏌婂鍥╂瀭闁汇劌瀚棢闁规亽鍎卞﹢鎾锤閳ь剟宕仦鐣岀Ъ闁告挸绉堕顒勫矗閿濆嫮顏遍柤閿嬬暘閳?/p>
       <pre>python run_bridge.py --host 127.0.0.1 --port 9527</pre>
     </div>
   </main>

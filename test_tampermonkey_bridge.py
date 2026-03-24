@@ -1,4 +1,6 @@
 import json
+import io
+import tempfile
 import threading
 import unittest
 import urllib.request
@@ -6,16 +8,21 @@ from pathlib import Path
 from unittest import mock
 
 from app.models import DlnaDevice, DlnaService
+import app.web_video_extractor as web_video_extractor
 from app.web_video_extractor import ResolvedMediaSource
 import tampermonkey_bridge
 from tampermonkey_bridge import (
     BridgeTask,
+    LiveHlsTranscodeSession,
     TampermonkeyBridgeService,
+    _build_video_filter_chain,
     _build_transcode_attempts,
     create_bridge_server,
     detect_preferred_h264_hardware_encoder,
     filter_forward_headers,
+    mux_remote_streams_to_compatible_mp4,
     resolve_source_with_yt_dlp_fallback,
+    transcode_remote_media_to_compatible_mp4,
 )
 
 
@@ -41,6 +48,29 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         tampermonkey_bridge._FFMPEG_ENCODER_LIST_CACHE.clear()
         tampermonkey_bridge._FFMPEG_HW_ENCODER_CACHE.clear()
+
+    @staticmethod
+    def _make_binary_response(payload: bytes) -> mock.MagicMock:
+        response = mock.MagicMock()
+        stream = io.BytesIO(payload)
+        response.read.side_effect = stream.read
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    def test_build_live_hls_output_command_uses_compatible_hls_flags(self) -> None:
+        command, playlist_path = tampermonkey_bridge._build_live_hls_output_command(
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            ["-i", "http://127.0.0.1:4123/media/demo.m3u8"],
+            ["-map", "0:v:0", "-map", "0:a:0?"],
+            Path(r"C:\temp\live"),
+            "quality",
+        )
+
+        self.assertEqual(playlist_path, Path(r"C:\temp\live\index.m3u8"))
+        flag_index = command.index("-hls_flags")
+        self.assertEqual(command[flag_index + 1], tampermonkey_bridge.LIVE_HLS_FLAGS)
+        self.assertNotIn("temp_file", command[flag_index + 1])
 
     def test_filter_forward_headers_is_case_insensitive(self) -> None:
         headers = filter_forward_headers(
@@ -71,15 +101,64 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
         service = TampermonkeyBridgeService()
         resolved = service.resolve_source(
             "https://example.com/watch/1",
-            display_name="页面标题",
+            display_name="椤甸潰鏍囬",
             headers={"referer": "https://example.com/watch/1", "cookie": "sid=1"},
         )
 
-        self.assertEqual(resolved.display_name, "页面标题")
+        self.assertEqual(resolved.display_name, "椤甸潰鏍囬")
         self.assertEqual(resolved.media_url, "https://cdn.example.com/video/demo.m3u8")
         self.assertEqual(resolved.headers["Referer"], "https://example.com/watch/1")
         self.assertEqual(resolved.headers["Cookie"], "sid=1")
         self.assertEqual(resolved.headers["User-Agent"], "BridgeUA/1.0")
+
+    @mock.patch("app.web_video_extractor._load_yt_dlp_module")
+    def test_web_video_extractor_retries_without_format_selector_when_selector_is_unavailable(
+        self,
+        load_yt_dlp_module: mock.Mock,
+    ) -> None:
+        option_calls: list[dict[str, object]] = []
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = dict(options)
+                option_calls.append(self.options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=False):
+                if self.options.get("format"):
+                    raise Exception("Requested format is not available. Use --list-formats for a list of available formats")
+                return {
+                    "title": "Bili Demo",
+                    "formats": [
+                        {
+                            "format_id": "muxed",
+                            "url": "https://cdn.example.com/video_1080.mp4",
+                            "ext": "mp4",
+                            "height": 1080,
+                            "vcodec": "avc1.640028",
+                            "acodec": "mp4a.40.2",
+                        }
+                    ],
+                }
+
+        class FakeModule:
+            YoutubeDL = FakeYoutubeDL
+
+        load_yt_dlp_module.return_value = FakeModule()
+
+        resolved = web_video_extractor.resolve_media_source("https://www.bilibili.com/video/BVdemo")
+
+        self.assertEqual(len(option_calls), 2)
+        self.assertIn("format", option_calls[0])
+        self.assertNotIn("format", option_calls[1])
+        self.assertIn("logger", option_calls[0])
+        self.assertEqual(resolved.media_url, "https://cdn.example.com/video_1080.mp4")
+        self.assertEqual(resolved.display_name, "Bili Demo")
 
     @mock.patch("tampermonkey_bridge._load_yt_dlp_module")
     def test_fallback_resolver_marks_separate_streams_for_local_mux(self, load_yt_dlp_module: mock.Mock) -> None:
@@ -210,6 +289,135 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
         self.assertTrue(resolved.requires_local_mux)
         self.assertEqual(resolved.video_url, "https://cdn.example.com/video_720.m4s")
 
+    @mock.patch("tampermonkey_bridge._load_yt_dlp_module")
+    def test_fallback_resolver_uses_best_available_below_1440p_cap(self, load_yt_dlp_module: mock.Mock) -> None:
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=False):
+                return {
+                    "title": "Bili Demo",
+                    "http_headers": {"Referer": url},
+                    "requested_formats": [
+                        {
+                            "format_id": "video-1080",
+                            "url": "https://cdn.example.com/video_1080.m4s",
+                            "ext": "mp4",
+                            "height": 1080,
+                            "vcodec": "avc1.640028",
+                            "acodec": "none",
+                        },
+                        {
+                            "format_id": "audio",
+                            "url": "https://cdn.example.com/audio_only.m4s",
+                            "ext": "m4a",
+                            "vcodec": "none",
+                            "acodec": "mp4a.40.2",
+                            "abr": 192,
+                        },
+                    ],
+                    "formats": [
+                        {
+                            "format_id": "video-1080",
+                            "url": "https://cdn.example.com/video_1080.m4s",
+                            "ext": "mp4",
+                            "height": 1080,
+                            "vcodec": "avc1.640028",
+                            "acodec": "none",
+                        },
+                        {
+                            "format_id": "audio",
+                            "url": "https://cdn.example.com/audio_only.m4s",
+                            "ext": "m4a",
+                            "vcodec": "none",
+                            "acodec": "mp4a.40.2",
+                            "abr": 192,
+                        },
+                    ],
+                }
+
+        class FakeModule:
+            YoutubeDL = FakeYoutubeDL
+
+        load_yt_dlp_module.return_value = FakeModule()
+
+        resolved = resolve_source_with_yt_dlp_fallback(
+            "https://www.bilibili.com/video/BVdemo",
+            display_name="Bili Demo",
+            quality="1440p",
+        )
+
+        self.assertTrue(resolved.requires_local_mux)
+        self.assertEqual(resolved.video_url, "https://cdn.example.com/video_1080.m4s")
+
+    @mock.patch("tampermonkey_bridge._load_yt_dlp_module")
+    def test_fallback_resolver_retries_without_format_selector_when_selector_is_unavailable(
+        self,
+        load_yt_dlp_module: mock.Mock,
+    ) -> None:
+        option_calls: list[dict[str, object]] = []
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = dict(options)
+                option_calls.append(self.options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=False):
+                if self.options.get("format"):
+                    raise Exception("Requested format is not available. Use --list-formats for a list of available formats")
+                return {
+                    "title": "Bili Demo",
+                    "http_headers": {"Referer": url},
+                    "formats": [
+                        {
+                            "format_id": "video",
+                            "url": "https://cdn.example.com/video_only.m4s",
+                            "ext": "mp4",
+                            "height": 1080,
+                            "vcodec": "avc1.640028",
+                            "acodec": "none",
+                        },
+                        {
+                            "format_id": "audio",
+                            "url": "https://cdn.example.com/audio_only.m4s",
+                            "ext": "m4a",
+                            "vcodec": "none",
+                            "acodec": "mp4a.40.2",
+                            "abr": 192,
+                        },
+                    ],
+                }
+
+        class FakeModule:
+            YoutubeDL = FakeYoutubeDL
+
+        load_yt_dlp_module.return_value = FakeModule()
+
+        resolved = resolve_source_with_yt_dlp_fallback(
+            "https://www.bilibili.com/video/BVdemo",
+            display_name="Bili Demo",
+        )
+
+        self.assertEqual(len(option_calls), 2)
+        self.assertIn("format", option_calls[0])
+        self.assertNotIn("format", option_calls[1])
+        self.assertTrue(resolved.requires_local_mux)
+        self.assertEqual(resolved.video_url, "https://cdn.example.com/video_only.m4s")
+        self.assertEqual(resolved.audio_url, "https://cdn.example.com/audio_only.m4s")
+
     @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
     @mock.patch("tampermonkey_bridge.resolve_media_source")
     def test_service_resolve_source_uses_fallback_for_non_max_quality(
@@ -235,12 +443,432 @@ class TampermonkeyBridgeServiceTests(unittest.TestCase):
         resolve_source_with_yt_dlp_fallback.assert_called_once()
         self.assertEqual(resolve_source_with_yt_dlp_fallback.call_args.kwargs["quality"], "720p")
 
-    def test_build_transcode_attempts_downgrades_smooth_without_hardware(self) -> None:
+    @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
+    @mock.patch("tampermonkey_bridge.resolve_media_source")
+    def test_service_resolve_source_prefers_mux_aware_fallback_for_bilibili_pages(
+        self,
+        resolve_media_source: mock.Mock,
+        resolve_source_with_yt_dlp_fallback: mock.Mock,
+    ) -> None:
+        resolve_source_with_yt_dlp_fallback.return_value = mock.Mock(
+            source_url="https://www.bilibili.com/video/BVdemo",
+            media_url="https://cdn.example.com/video_only.m4s",
+            display_name="Bili Demo",
+            headers={"Referer": "https://www.bilibili.com/video/BVdemo"},
+            resolved_from_page=True,
+            requires_local_mux=True,
+            video_url="https://cdn.example.com/video_only.m4s",
+            audio_url="https://cdn.example.com/audio_only.m4s",
+            video_headers={"Referer": "https://www.bilibili.com/video/BVdemo"},
+            audio_headers={"Referer": "https://www.bilibili.com/video/BVdemo"},
+        )
+
+        service = TampermonkeyBridgeService()
+        resolved = service.resolve_source("https://www.bilibili.com/video/BVdemo", display_name="Bili Demo")
+
+        resolve_media_source.assert_not_called()
+        resolve_source_with_yt_dlp_fallback.assert_called_once()
+        self.assertEqual(resolve_source_with_yt_dlp_fallback.call_args.kwargs["quality"], "max")
+        self.assertTrue(resolved.requires_local_mux)
+        self.assertEqual(resolved.video_url, "https://cdn.example.com/video_only.m4s")
+        self.assertEqual(resolved.audio_url, "https://cdn.example.com/audio_only.m4s")
+
+    @mock.patch("tampermonkey_bridge.resolve_source_with_yt_dlp_fallback")
+    @mock.patch("tampermonkey_bridge.resolve_media_source")
+    def test_service_resolve_source_falls_back_to_direct_extractor_when_mux_aware_fallback_fails(
+        self,
+        resolve_media_source: mock.Mock,
+        resolve_source_with_yt_dlp_fallback: mock.Mock,
+    ) -> None:
+        resolve_source_with_yt_dlp_fallback.side_effect = web_video_extractor.VideoPageExtractionError("fallback failed")
+        resolve_media_source.return_value = ResolvedMediaSource(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Bili Demo",
+            original_url="https://www.bilibili.com/video/BVdemo",
+            headers={"User-Agent": "BridgeUA/1.0"},
+            resolved_from_page=True,
+        )
+
+        service = TampermonkeyBridgeService()
+        resolved = service.resolve_source(
+            "https://www.bilibili.com/video/BVdemo",
+            display_name="Bili Demo",
+            headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+        )
+
+        resolve_source_with_yt_dlp_fallback.assert_called_once()
+        resolve_media_source.assert_called_once_with("https://www.bilibili.com/video/BVdemo")
+        self.assertEqual(resolved.media_url, "https://cdn.example.com/video/demo.m3u8")
+        self.assertEqual(resolved.headers["Referer"], "https://www.bilibili.com/video/BVdemo")
+        self.assertEqual(resolved.headers["User-Agent"], "BridgeUA/1.0")
+        self.assertFalse(resolved.requires_local_mux)
+
+    def test_build_transcode_attempts_keep_smooth_without_hardware(self) -> None:
         attempts = _build_transcode_attempts("smooth", hardware_encoder="")
         self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0].effective_profile, "quality")
+        self.assertEqual(attempts[0].effective_profile, "smooth")
         self.assertEqual(attempts[0].encoder_name, "libx264")
-        self.assertTrue(attempts[0].downgraded)
+        self.assertTrue(attempts[0].smooth_fallback)
+        self.assertFalse(attempts[0].downgraded)
+
+    def test_build_video_filter_chain_targets_stable_30fps_for_smooth(self) -> None:
+        chain = _build_video_filter_chain("smooth", encoder_name="libx264")
+        self.assertEqual(
+            chain,
+            "scale=w='min(960,iw)':h='min(540,ih)':force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30000/1001",
+        )
+
+    def test_build_video_filter_chain_caps_smooth_resolution_for_hardware(self) -> None:
+        chain = _build_video_filter_chain("smooth", encoder_name="h264_qsv")
+        self.assertEqual(
+            chain,
+            "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30000/1001,format=nv12",
+        )
+
+    def test_build_live_hls_output_command_uses_realtime_friendly_smooth_settings(self) -> None:
+        command, _ = tampermonkey_bridge._build_live_hls_output_command(
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            ["-i", "http://127.0.0.1:4123/media/demo.m3u8"],
+            ["-map", "0:v:0", "-map", "0:a:0?"],
+            Path(r"C:\temp\live"),
+            "smooth",
+            encoder_name="libx264",
+            smooth_fallback=True,
+        )
+
+        self.assertIn("-preset", command)
+        self.assertEqual(command[command.index("-preset") + 1], "superfast")
+        self.assertEqual(command[command.index("-crf") + 1], "25")
+        self.assertEqual(command[command.index("-b:a") + 1], "96k")
+        self.assertEqual(command[command.index("-tune") + 1], "zerolatency")
+        self.assertEqual(command[command.index("-g") + 1], "60")
+        self.assertEqual(command[command.index("-keyint_min") + 1], "60")
+        self.assertEqual(command[command.index("-sc_threshold") + 1], "0")
+
+    def test_live_hls_session_reports_buffered_duration_from_playlist(self) -> None:
+        process = mock.Mock()
+        process.stderr = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            playlist_path = Path(temp_dir) / "index.m3u8"
+            playlist_path.write_text(
+                "#EXTM3U\n#EXTINF:2.0,\nsegment_00001.ts\n#EXTINF:2.0,\nsegment_00002.ts\n#EXTINF:2.0,\nsegment_00003.ts\n",
+                encoding="utf-8",
+            )
+            session = LiveHlsTranscodeSession(
+                output_dir=Path(temp_dir),
+                playlist_path=playlist_path,
+                process=process,
+                proxy_servers=[],
+            )
+            try:
+                self.assertAlmostEqual(session.buffered_duration_seconds(), 6.0)
+            finally:
+                session.stop(cleanup=False)
+
+    @mock.patch("tampermonkey_bridge.start_live_hls_transcode_session")
+    @mock.patch("tampermonkey_bridge.set_media_with_title")
+    @mock.patch("tampermonkey_bridge.resolve_media_source")
+    @mock.patch("tampermonkey_bridge.DlnaController")
+    def test_service_uses_live_hls_transcode_for_smooth_hls(
+        self,
+        dlna_controller_cls: mock.Mock,
+        resolve_media_source: mock.Mock,
+        set_media_with_title: mock.Mock,
+        start_live_hls_transcode_session: mock.Mock,
+    ) -> None:
+        device = sample_device()
+        service = TampermonkeyBridgeService()
+        service._devices_by_location = {device.location: device}
+
+        resolve_media_source.return_value = ResolvedMediaSource(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Demo Stream",
+            original_url="https://example.com/watch/1",
+            headers={"User-Agent": "BridgeUA/1.0"},
+            resolved_from_page=True,
+        )
+
+        controller = mock.Mock()
+        dlna_controller_cls.return_value = controller
+
+        live_session = mock.Mock()
+        live_session.playlist_path = Path(r"C:\temp\live\index.m3u8")
+        start_live_hls_transcode_session.return_value = live_session
+
+        def fake_start_hls(playlist_path: str, display_name: str) -> str:
+            service.http_server._player_url = "http://192.168.1.88:4123/player"
+            return "http://192.168.1.88:4123/media/live/index.m3u8"
+
+        service.http_server.start_hls = mock.Mock(side_effect=fake_start_hls)
+
+        payload = service.cast(
+            device_location=device.location,
+            source_url="https://example.com/watch/1",
+            display_name="Page Title",
+            headers={"referer": "https://example.com/watch/1"},
+            transcode_profile="smooth",
+        )
+
+        start_live_hls_transcode_session.assert_called_once_with(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Page Title",
+            headers={
+                "Referer": "https://example.com/watch/1",
+                "User-Agent": "BridgeUA/1.0",
+            },
+            transcode_profile="smooth",
+            startup_buffer_seconds=15.0,
+        )
+        service.http_server.start_hls.assert_called_once_with(str(live_session.playlist_path), "Page Title")
+        set_media_with_title.assert_called_once_with(
+            controller,
+            "http://192.168.1.88:4123/media/live/index.m3u8",
+            str(live_session.playlist_path),
+            "Page Title",
+        )
+        controller.play.assert_called_once_with("1")
+        self.assertEqual(payload["player_url"], "http://192.168.1.88:4123/player")
+        self.assertIs(service.current_live_transcode_session, live_session)
+
+        service.stop()
+        live_session.stop.assert_called_once_with()
+
+    @mock.patch("tampermonkey_bridge.set_media_with_title")
+    @mock.patch("tampermonkey_bridge.transcode_remote_media_to_compatible_mp4")
+    @mock.patch("tampermonkey_bridge.start_live_hls_transcode_session")
+    @mock.patch("tampermonkey_bridge.resolve_media_source")
+    @mock.patch("tampermonkey_bridge.DlnaController")
+    def test_service_uses_full_transcode_for_quality_hls(
+        self,
+        dlna_controller_cls: mock.Mock,
+        resolve_media_source: mock.Mock,
+        start_live_hls_transcode_session: mock.Mock,
+        transcode_remote_media_to_compatible_mp4: mock.Mock,
+        set_media_with_title: mock.Mock,
+    ) -> None:
+        device = sample_device()
+        service = TampermonkeyBridgeService()
+        service._devices_by_location = {device.location: device}
+
+        resolve_media_source.return_value = ResolvedMediaSource(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Demo Stream",
+            original_url="https://example.com/watch/1",
+            headers={"User-Agent": "BridgeUA/1.0"},
+            resolved_from_page=True,
+        )
+
+        controller = mock.Mock()
+        dlna_controller_cls.return_value = controller
+
+        transcoded_file = Path(r"C:\temp\demo_quality.mp4")
+        transcode_remote_media_to_compatible_mp4.return_value = transcoded_file
+        service.http_server.start = mock.Mock(return_value="http://192.168.1.88:4123/media/demo_quality.mp4")
+        service.http_server.start_hls = mock.Mock()
+        service.http_server._player_url = "http://192.168.1.88:4123/player"
+
+        payload = service.cast(
+            device_location=device.location,
+            source_url="https://example.com/watch/1",
+            display_name="Page Title",
+            headers={"referer": "https://example.com/watch/1"},
+            transcode_profile="quality",
+        )
+
+        start_live_hls_transcode_session.assert_not_called()
+        transcode_remote_media_to_compatible_mp4.assert_called_once_with(
+            media_url="https://cdn.example.com/video/demo.m3u8",
+            display_name="Page Title",
+            headers={
+                "Referer": "https://example.com/watch/1",
+                "User-Agent": "BridgeUA/1.0",
+            },
+            transcode_profile="quality",
+        )
+        service.http_server.start.assert_called_once_with(str(transcoded_file))
+        service.http_server.start_hls.assert_not_called()
+        set_media_with_title.assert_called_once_with(
+            controller,
+            "http://192.168.1.88:4123/media/demo_quality.mp4",
+            str(transcoded_file),
+            "Page Title",
+        )
+        controller.play.assert_called_once_with("1")
+        self.assertEqual(payload["player_url"], "http://192.168.1.88:4123/player")
+        self.assertIsNone(service.current_live_transcode_session)
+
+
+    @mock.patch("tampermonkey_bridge._try_fast_compatible_hls_remux")
+    @mock.patch("tampermonkey_bridge._run_transcode_command")
+    @mock.patch("tampermonkey_bridge.find_ffmpeg")
+    @mock.patch("tampermonkey_bridge.MediaHttpServer")
+    def test_remote_transcode_uses_local_proxy_for_ffmpeg_input(
+        self,
+        media_http_server_cls: mock.Mock,
+        find_ffmpeg: mock.Mock,
+        run_transcode_command: mock.Mock,
+        try_fast_compatible_hls_remux: mock.Mock,
+    ) -> None:
+        ffmpeg_path = Path(r"C:\ffmpeg\bin\ffmpeg.exe")
+        proxied_media_url = "http://127.0.0.1:4123/media/demo.m3u8"
+        transcoded_file = Path(r"C:\temp\demo_quality.mp4")
+        proxy_server = mock.Mock()
+
+        media_http_server_cls.return_value = proxy_server
+        proxy_server.start_remote.return_value = proxied_media_url
+        find_ffmpeg.return_value = ffmpeg_path
+        run_transcode_command.return_value = transcoded_file
+        try_fast_compatible_hls_remux.return_value = None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(tampermonkey_bridge, "REMOTE_TRANSCODE_CACHE_DIR", Path(temp_dir)):
+                result = transcode_remote_media_to_compatible_mp4(
+                    media_url="https://cdn.example.com/video/demo.m3u8?token=abc",
+                    display_name="Demo Stream",
+                    headers={
+                        "referer": "https://example.com/watch/1",
+                        "cookie": "sid=1",
+                        "x-ignored": "ignored",
+                    },
+                    transcode_profile="quality",
+                )
+
+        self.assertEqual(result, transcoded_file)
+        media_http_server_cls.assert_called_once_with()
+        proxy_server.start_remote.assert_called_once_with(
+            "https://cdn.example.com/video/demo.m3u8?token=abc",
+            "Demo Stream",
+            headers={
+                "Referer": "https://example.com/watch/1",
+                "Cookie": "sid=1",
+            },
+        )
+        run_transcode_command.assert_called_once()
+        try_fast_compatible_hls_remux.assert_called_once()
+        self.assertEqual(run_transcode_command.call_args.args[0], ffmpeg_path)
+        self.assertEqual(run_transcode_command.call_args.args[1], ["-i", proxied_media_url])
+        self.assertEqual(run_transcode_command.call_args.args[2], ["-map", "0:v:0", "-map", "0:a:0?"])
+        self.assertEqual(run_transcode_command.call_args.args[4], "quality")
+        self.assertEqual(run_transcode_command.call_args.args[3].parent, Path(temp_dir))
+        proxy_server.stop.assert_called_once_with()
+
+    @mock.patch("tampermonkey_bridge._try_fast_compatible_hls_remux")
+    @mock.patch("tampermonkey_bridge._run_transcode_command")
+    @mock.patch("tampermonkey_bridge.find_ffmpeg")
+    @mock.patch("tampermonkey_bridge.MediaHttpServer")
+    def test_remote_transcode_prefers_fast_hls_remux_when_possible(
+        self,
+        media_http_server_cls: mock.Mock,
+        find_ffmpeg: mock.Mock,
+        run_transcode_command: mock.Mock,
+        try_fast_compatible_hls_remux: mock.Mock,
+    ) -> None:
+        ffmpeg_path = Path(r"C:\ffmpeg\bin\ffmpeg.exe")
+        proxied_media_url = "http://127.0.0.1:4123/media/demo.m3u8"
+        fast_file = Path(r"C:\temp\demo_quality_fast.mp4")
+        proxy_server = mock.Mock()
+
+        media_http_server_cls.return_value = proxy_server
+        proxy_server.start_remote.return_value = proxied_media_url
+        find_ffmpeg.return_value = ffmpeg_path
+        try_fast_compatible_hls_remux.return_value = fast_file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(tampermonkey_bridge, "REMOTE_TRANSCODE_CACHE_DIR", Path(temp_dir)):
+                result = transcode_remote_media_to_compatible_mp4(
+                    media_url="https://cdn.example.com/video/demo.m3u8?token=abc",
+                    display_name="Demo Stream",
+                    headers={"referer": "https://example.com/watch/1"},
+                    transcode_profile="quality",
+                )
+
+        self.assertEqual(result, fast_file)
+        try_fast_compatible_hls_remux.assert_called_once()
+        run_transcode_command.assert_not_called()
+        proxy_server.stop.assert_called_once_with()
+
+    @mock.patch("tampermonkey_bridge.urllib.request.urlopen")
+    @mock.patch("tampermonkey_bridge._run_transcode_command")
+    @mock.patch("tampermonkey_bridge._try_fast_compatible_local_stream_mux")
+    @mock.patch("tampermonkey_bridge.find_ffmpeg")
+    def test_quality_mux_prefers_fast_local_stream_mux_when_streams_are_already_compatible(
+        self,
+        find_ffmpeg: mock.Mock,
+        try_fast_compatible_local_stream_mux: mock.Mock,
+        run_transcode_command: mock.Mock,
+        urlopen: mock.Mock,
+    ) -> None:
+        ffmpeg_path = Path(r"C:\ffmpeg\bin\ffmpeg.exe")
+        fast_file = Path(r"C:\temp\demo_quality_fast.mp4")
+
+        find_ffmpeg.return_value = ffmpeg_path
+        try_fast_compatible_local_stream_mux.return_value = fast_file
+        urlopen.side_effect = [
+            self._make_binary_response(b"video-bytes"),
+            self._make_binary_response(b"audio-bytes"),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(tampermonkey_bridge, "REMOTE_MUX_CACHE_DIR", Path(temp_dir)):
+                result = mux_remote_streams_to_compatible_mp4(
+                    video_url="https://cdn.example.com/video_1080.m4s",
+                    audio_url="https://cdn.example.com/audio_only.m4s",
+                    display_name="Bili Demo",
+                    video_headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+                    audio_headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+                    transcode_profile="quality",
+                )
+
+        self.assertEqual(result, fast_file)
+        try_fast_compatible_local_stream_mux.assert_called_once()
+        self.assertEqual(try_fast_compatible_local_stream_mux.call_args.args[0], ffmpeg_path)
+        self.assertEqual(try_fast_compatible_local_stream_mux.call_args.args[3].suffix, ".mp4")
+        run_transcode_command.assert_not_called()
+        self.assertEqual(urlopen.call_count, 2)
+
+    @mock.patch("tampermonkey_bridge.urllib.request.urlopen")
+    @mock.patch("tampermonkey_bridge._run_transcode_command")
+    @mock.patch("tampermonkey_bridge._try_fast_compatible_local_stream_mux")
+    @mock.patch("tampermonkey_bridge.find_ffmpeg")
+    def test_quality_mux_falls_back_to_transcode_when_fast_local_stream_mux_is_not_possible(
+        self,
+        find_ffmpeg: mock.Mock,
+        try_fast_compatible_local_stream_mux: mock.Mock,
+        run_transcode_command: mock.Mock,
+        urlopen: mock.Mock,
+    ) -> None:
+        ffmpeg_path = Path(r"C:\ffmpeg\bin\ffmpeg.exe")
+        transcoded_file = Path(r"C:\temp\demo_quality.mp4")
+
+        find_ffmpeg.return_value = ffmpeg_path
+        try_fast_compatible_local_stream_mux.return_value = None
+        run_transcode_command.return_value = transcoded_file
+        urlopen.side_effect = [
+            self._make_binary_response(b"video-bytes"),
+            self._make_binary_response(b"audio-bytes"),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(tampermonkey_bridge, "REMOTE_MUX_CACHE_DIR", Path(temp_dir)):
+                result = mux_remote_streams_to_compatible_mp4(
+                    video_url="https://cdn.example.com/video_av1.m4s",
+                    audio_url="https://cdn.example.com/audio_only.m4s",
+                    display_name="Bili Demo",
+                    video_headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+                    audio_headers={"referer": "https://www.bilibili.com/video/BVdemo"},
+                    transcode_profile="quality",
+                )
+
+        self.assertEqual(result, transcoded_file)
+        try_fast_compatible_local_stream_mux.assert_called_once()
+        run_transcode_command.assert_called_once()
+        self.assertEqual(run_transcode_command.call_args.args[0], ffmpeg_path)
+        self.assertEqual(run_transcode_command.call_args.args[1][0], "-i")
+        self.assertEqual(run_transcode_command.call_args.args[2], ["-map", "0:v:0", "-map", "1:a:0"])
+        self.assertEqual(run_transcode_command.call_args.args[4], "quality")
+        self.assertEqual(urlopen.call_count, 2)
 
     def test_get_task_is_not_blocked_by_playback_lock(self) -> None:
         service = TampermonkeyBridgeService()
@@ -389,7 +1017,7 @@ class BridgeHttpApiTests(unittest.TestCase):
             {
                 "device_location": device.location,
                 "source_url": "https://example.com/watch/1",
-                "display_name": "页面标题",
+                "display_name": "椤甸潰鏍囬",
                 "headers": {
                     "referer": "https://example.com/watch/1",
                     "cookie": "sid=1",
@@ -401,13 +1029,13 @@ class BridgeHttpApiTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["device"]["display_name"], "Living Room TV (OpenAI Demo TV)")
         self.assertEqual(payload["player_url"], "http://192.168.1.88:4123/player")
-        self.assertEqual(payload["resolved_source"]["display_name"], "页面标题")
+        self.assertEqual(payload["resolved_source"]["display_name"], "椤甸潰鏍囬")
         self.service.http_server.start_remote.assert_called_once()
         set_media_with_title.assert_called_once_with(
             controller,
             "http://192.168.1.88:4123/media/demo.m3u8",
             "https://cdn.example.com/video/demo.m3u8",
-            "页面标题",
+            "椤甸潰鏍囬",
         )
         controller.play.assert_called_once_with("1")
 
@@ -484,7 +1112,7 @@ class BridgeHttpApiTests(unittest.TestCase):
         self.service.resolve_source = mock.Mock(
             return_value=mock.Mock(
                 source_url="https://example.com/watch/1",
-                media_url="https://cdn.example.com/video/demo.m3u8",
+                media_url="https://cdn.example.com/video/demo.mp4",
                 display_name="Demo Stream",
                 headers={"Referer": "https://example.com/watch/1"},
                 resolved_from_page=True,
@@ -503,7 +1131,7 @@ class BridgeHttpApiTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         transcode_remote_media_to_compatible_mp4.assert_called_once_with(
-            media_url="https://cdn.example.com/video/demo.m3u8",
+            media_url="https://cdn.example.com/video/demo.mp4",
             display_name="Demo Stream",
             headers={"Referer": "https://example.com/watch/1"},
             transcode_profile="quality",

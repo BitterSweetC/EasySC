@@ -34,13 +34,20 @@ from app.windows_projection import (
     switch_projection_mode,
 )
 
-PAGE_BG = "#F5F7FB"
+PAGE_BG = "#F3F5F7"
+SURFACE_SOFT = "#F6F8FA"
 CARD_BG = "#FFFFFF"
-CARD_BORDER = "#DCE3EE"
-PRIMARY = "#2F6BFF"
-PRIMARY_SOFT = "#EAF2FF"
-TEXT_PRIMARY = "#152033"
-TEXT_SECONDARY = "#5D6B82"
+CARD_BORDER = "#D8DFE6"
+PRIMARY = "#335C81"
+PRIMARY_HOVER = "#274865"
+PRIMARY_SOFT = "#ECF1F6"
+ACCENT = "#50657A"
+ACCENT_SOFT = "#F0F3F6"
+WARNING = "#66758A"
+WARNING_SOFT = "#F2F4F7"
+TEXT_PRIMARY = "#17212B"
+TEXT_SECONDARY = "#5E6B78"
+TEXT_MUTED = "#8A94A1"
 
 PRESET_LABEL_TO_KEY = {
     "流畅": "Smooth",
@@ -51,23 +58,23 @@ PRESET_LABEL_TO_KEY = {
 MODE_META = {
     CAPTURE_MODE_FULL_DESKTOP: {
         "title": "电脑全部投屏",
-        "badge": "原生推荐",
-        "summary": "直接调用 Windows 原生无线投放，体验最接近系统自带“连接到无线显示器”。",
-        "detail": "适合把整个电脑桌面、声音和显示模式一起投到电视。连接后可直接切换复制屏幕 / 扩展屏幕。",
+        "badge": "原生",
+        "summary": "调用 Windows 原生无线投放。",
+        "detail": "适合整机桌面与系统声音，连接后可直接切换复制或扩展模式。",
         "button": "打开 Win+K 投放",
     },
     CAPTURE_MODE_SINGLE_MONITOR: {
         "title": "投屏一个屏幕",
-        "badge": "单屏兼容",
-        "summary": "只共享一块显示器，适合双屏办公时把指定屏幕单独投出。",
-        "detail": "会启动兼容镜像接收地址，你可以在电视浏览器中打开该地址进行投屏。",
+        "badge": "单屏",
+        "summary": "共享指定显示器，适合双屏办公。",
+        "detail": "生成镜像接收地址，在电视浏览器打开即可。",
         "button": "开始单屏投屏",
     },
     CAPTURE_MODE_ACTIVE_WINDOW: {
         "title": "投屏当前页面",
-        "badge": "演示模式",
-        "summary": "只共享当前前台窗口，适合 PPT、浏览器页面或演示软件。",
-        "detail": "先点击一次选中该模式，再点击一次开始投屏。开始后会有 3 秒倒计时，请在倒计时期间切到你要投屏的页面。",
+        "badge": "窗口",
+        "summary": "共享当前前台窗口，适合演示。",
+        "detail": "启动后有 3 秒倒计时，请先切到目标页面。",
         "button": "开始当前页面投屏",
     },
 }
@@ -77,8 +84,8 @@ class ScreenCastingApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("视频投送助手")
-        self.geometry("1180x820")
-        self.minsize(1020, 700)
+        self.geometry("1260x860")
+        self.minsize(1120, 760)
         self.configure(bg=PAGE_BG)
 
         self.devices: list[DlnaDevice] = []
@@ -92,6 +99,9 @@ class ScreenCastingApp(tk.Tk):
         self.latest_diagnostics: ProjectionDiagnostics | None = None
 
         self.status_var = tk.StringVar(value="就绪：请选择本地视频、网络视频直链或视频播放页地址。本地文件会先自动转为电视兼容 MP4，再进行直投或生成兼容播放页。")
+        self.header_source_var = tk.StringVar(value="未选择来源")
+        self.header_device_var = tk.StringVar(value="未选择电视/盒子")
+        self.header_next_step_var = tk.StringVar(value="下一步：选择视频或输入网址。")
         self.os_var = tk.StringVar(value="未检测")
         self.wlan_var = tk.StringVar(value="未检测")
         self.miracast_var = tk.StringVar(value="未检测")
@@ -113,61 +123,162 @@ class ScreenCastingApp(tk.Tk):
         self.start_action_text_var = tk.StringVar(value=MODE_META[CAPTURE_MODE_FULL_DESKTOP]["button"])
 
         self.file_var = tk.StringVar(value="未选择本地视频或网络视频地址")
+        self.source_type_var = tk.StringVar(value="未选择来源")
+        self.source_tip_var = tk.StringVar(value="先选本地视频，或输入网络视频直链 / 播放页地址。")
         self.speed_var = tk.StringVar(value="1")
         self.volume_var = tk.IntVar(value=50)
+        self.volume_text_var = tk.StringVar(value="50%")
         self.media_url_var = tk.StringVar(value="当前未生成兼容视频地址")
         self.player_url_var = tk.StringVar(value="当前未生成兼容播放页地址")
 
+        self.volume_var.trace_add("write", self._update_volume_text)
         self._configure_styles()
         self._build_layout()
+        self._refresh_overview_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self.refresh_projection_info)
         self.after(300, self.refresh_monitor_list)
         self.after(900, self.scan_devices)
 
     def _configure_styles(self) -> None:
+        self.option_add("*Font", ("Microsoft YaHei UI", 10))
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
         style.configure("App.TNotebook", background=PAGE_BG, borderwidth=0)
-        style.configure("App.TNotebook.Tab", padding=(18, 10), font=("Microsoft YaHei UI", 10, "bold"))
-        style.map("App.TNotebook.Tab", background=[("selected", CARD_BG)], foreground=[("selected", PRIMARY)])
-        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"), padding=(14, 10))
-        style.configure("Secondary.TButton", font=("Microsoft YaHei UI", 10), padding=(12, 9))
-        style.configure("Soft.TCombobox", padding=6)
+        style.configure(
+            "App.TNotebook.Tab",
+            padding=(18, 10),
+            font=("Microsoft YaHei UI", 10, "bold"),
+            background=SURFACE_SOFT,
+            foreground=TEXT_SECONDARY,
+        )
+        style.map(
+            "App.TNotebook.Tab",
+            background=[("selected", CARD_BG), ("active", PRIMARY_SOFT)],
+            foreground=[("selected", PRIMARY), ("active", TEXT_PRIMARY)],
+        )
+        style.configure(
+            "Primary.TButton",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            padding=(14, 9),
+            background=PRIMARY,
+            foreground="#FFFFFF",
+            borderwidth=0,
+            focusthickness=0,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", PRIMARY_HOVER), ("pressed", PRIMARY_HOVER)],
+            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+        )
+        style.configure(
+            "HeroPrimary.TButton",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            padding=(16, 10),
+            background=PRIMARY,
+            foreground="#FFFFFF",
+            borderwidth=0,
+            focusthickness=0,
+        )
+        style.map(
+            "HeroPrimary.TButton",
+            background=[("active", PRIMARY_HOVER), ("pressed", PRIMARY_HOVER)],
+            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+        )
+        style.configure(
+            "Secondary.TButton",
+            font=("Microsoft YaHei UI", 10),
+            padding=(13, 9),
+            background=CARD_BG,
+            foreground=TEXT_PRIMARY,
+            bordercolor=CARD_BORDER,
+            lightcolor=CARD_BG,
+            darkcolor=CARD_BG,
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", PRIMARY_SOFT), ("pressed", PRIMARY_SOFT)],
+            foreground=[("active", PRIMARY), ("pressed", PRIMARY)],
+        )
+        style.configure(
+            "Soft.TCombobox",
+            padding=8,
+            fieldbackground=SURFACE_SOFT,
+            background=SURFACE_SOFT,
+            foreground=TEXT_PRIMARY,
+            bordercolor=CARD_BORDER,
+            arrowsize=13,
+        )
+        style.map(
+            "Soft.TCombobox",
+            fieldbackground=[("readonly", SURFACE_SOFT)],
+            selectbackground=[("readonly", SURFACE_SOFT)],
+            selectforeground=[("readonly", TEXT_PRIMARY)],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=SURFACE_SOFT,
+            troughcolor=SURFACE_SOFT,
+            bordercolor=SURFACE_SOFT,
+            arrowcolor=TEXT_SECONDARY,
+        )
+        style.configure("TScale", background=SURFACE_SOFT)
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        header = tk.Frame(self, bg=PAGE_BG)
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 12))
+        header = self._create_card(self, padx=22, pady=20)
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 14))
         header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
 
-        hero = tk.Frame(header, bg=PRIMARY, padx=24, pady=22)
-        hero.grid(row=0, column=0, sticky="ew")
-        hero.columnconfigure(0, weight=1)
-        hero.columnconfigure(1, weight=0)
+        title_block = tk.Frame(header, bg=CARD_BG)
+        title_block.grid(row=0, column=0, sticky="ew")
+        tk.Label(title_block, text="视频投送助手", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 22, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            title_block,
+            text="整合网页视频、本地视频和兼容投屏，优先展示当前状态与下一步操作。",
+            bg=CARD_BG,
+            fg=TEXT_SECONDARY,
+            font=("Microsoft YaHei UI", 10),
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        tk.Label(hero, text="视频投送助手", bg=PRIMARY, fg="#FFFFFF", font=("Microsoft YaHei UI", 22, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(hero, text="支持本地视频、网络视频直链、视频播放页地址直投，也支持电脑画面投到电视。在“兼容投屏”页直接提供“电脑全部投屏 / 投屏一个屏幕 / 投屏当前页面”三个固定按钮。", bg=PRIMARY, fg="#EAF2FF", font=("Microsoft YaHei UI", 10), wraplength=700, justify="left").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        hero_actions = tk.Frame(header, bg=CARD_BG)
+        hero_actions.grid(row=0, column=1, sticky="ne", padx=(18, 0))
+        ttk.Button(hero_actions, text="选择视频", command=self.choose_file, style="HeroPrimary.TButton").grid(row=0, column=0, padx=(0, 10))
+        ttk.Button(hero_actions, text="输入网址", command=self.use_media_url, style="Secondary.TButton").grid(row=0, column=1, padx=(0, 10))
+        ttk.Button(hero_actions, text="扫描设备", command=self.scan_devices, style="Secondary.TButton").grid(row=0, column=2)
 
-        hero_actions = tk.Frame(hero, bg=PRIMARY)
-        hero_actions.grid(row=0, column=1, rowspan=2, sticky="e")
-        ttk.Button(hero_actions, text="选择视频", command=self.choose_file, style="Primary.TButton").grid(row=0, column=0, padx=(0, 10))
-        ttk.Button(hero_actions, text="输入网址", command=self.use_media_url, style="Primary.TButton").grid(row=0, column=1, padx=(0, 10))
-        ttk.Button(hero_actions, text="扫描盒子", command=self.scan_devices, style="Primary.TButton").grid(row=0, column=2)
+        overview_row = tk.Frame(header, bg=CARD_BG)
+        overview_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        for column in range(3):
+            overview_row.columnconfigure(column, weight=1)
+        self._create_summary_card(overview_row, 0, "当前来源", self.header_source_var, tone="primary")
+        self._create_summary_card(overview_row, 1, "当前设备", self.header_device_var, tone="accent")
+        self._create_summary_card(overview_row, 2, "下一步建议", self.header_next_step_var, tone="warning")
 
-        status_strip = tk.Frame(header, bg=CARD_BG, padx=18, pady=10, highlightbackground=CARD_BORDER, highlightthickness=1)
-        status_strip.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        status_strip = tk.Frame(header, bg=SURFACE_SOFT, padx=16, pady=14, highlightbackground=CARD_BORDER, highlightthickness=1)
+        status_strip.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(18, 0))
         status_strip.columnconfigure(0, weight=1)
-        tk.Label(status_strip, text="当前状态", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(status_strip, textvariable=self.status_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=1040, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        tk.Label(status_strip, text="当前状态", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            status_strip,
+            textvariable=self.status_var,
+            bg=SURFACE_SOFT,
+            fg=TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 10),
+            wraplength=1120,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         notebook = ttk.Notebook(self, style="App.TNotebook")
-        notebook.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        notebook.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
 
         projection_tab = tk.Frame(notebook, bg=PAGE_BG)
         media_tab = tk.Frame(notebook, bg=PAGE_BG)
@@ -183,17 +294,100 @@ class ScreenCastingApp(tk.Tk):
         self._build_projection_tab(projection_tab)
 
     def _create_section_title(self, parent: tk.Widget, title: str, subtitle: str) -> None:
-        tk.Label(parent, text=title, bg=PAGE_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        tk.Label(parent, text=subtitle, bg=PAGE_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=1000, justify="left").pack(anchor="w", pady=(4, 0))
+        tk.Label(parent, text=title, bg=PAGE_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        tk.Label(parent, text=subtitle, bg=PAGE_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=1080, justify="left").pack(anchor="w", pady=(4, 0))
 
     def _create_card(self, parent: tk.Widget, *, padx: int = 18, pady: int = 18) -> tk.Frame:
         return tk.Frame(parent, bg=CARD_BG, padx=padx, pady=pady, highlightbackground=CARD_BORDER, highlightthickness=1)
+
+    def _create_summary_card(self, parent: tk.Widget, column: int, title: str, variable: tk.StringVar, *, tone: str) -> None:
+        tone_map = {
+            "primary": PRIMARY,
+            "accent": ACCENT,
+            "warning": WARNING,
+        }
+        card = self._create_card(parent, padx=16, pady=16)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+        tk.Frame(card, bg=tone_map[tone], height=3).pack(fill="x")
+        tk.Label(card, text=title, bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=(12, 0))
+        tk.Label(card, textvariable=variable, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 11, "bold"), wraplength=300, justify="left").pack(anchor="w", pady=(10, 0))
+
+    def _create_listbox(self, parent: tk.Widget, *, height: int = 7) -> tk.Listbox:
+        return tk.Listbox(
+            parent,
+            exportselection=False,
+            relief="flat",
+            borderwidth=0,
+            height=height,
+            font=("Microsoft YaHei UI", 10),
+            bg=SURFACE_SOFT,
+            fg=TEXT_PRIMARY,
+            selectbackground=PRIMARY,
+            selectforeground="#FFFFFF",
+            activestyle="none",
+            highlightthickness=0,
+        )
+
+    def _update_volume_text(self, *_args: object) -> None:
+        self.volume_text_var.set(f"{int(self.volume_var.get())}%")
+
+    def _truncate_text(self, value: str, limit: int = 54) -> str:
+        return value if len(value) <= limit else f"{value[:limit - 1]}…"
+
+    def _refresh_overview_state(self) -> None:
+        if self.selected_file is not None:
+            self.header_source_var.set(f"本地文件 · {self.selected_file.name}")
+            self.source_type_var.set("本地视频文件")
+            self.source_tip_var.set("开始投送或生成播放页时会自动转为兼容 MP4。")
+        elif self.selected_media_url:
+            display = self._truncate_text(self.selected_media_url)
+            if is_probable_direct_media_url(self.selected_media_url):
+                self.header_source_var.set(f"网络直链 · {display}")
+                self.source_type_var.set("网络视频直链")
+                self.source_tip_var.set("可以直接尝试 DLNA 推送，也可以先生成兼容播放页。")
+            else:
+                self.header_source_var.set(f"播放页地址 · {display}")
+                self.source_type_var.set("网页播放页地址")
+                self.source_tip_var.set("开始投送时会先解析真实视频流；如站点限制较强，可优先测试兼容播放页。")
+        else:
+            self.header_source_var.set("未选择来源")
+            self.source_type_var.set("未选择来源")
+            self.source_tip_var.set("先选本地视频，或输入网络视频直链 / 播放页地址。")
+
+        if self.device_count_var.get() == "扫描中…":
+            self.header_device_var.set("正在扫描电视/盒子…")
+            selected_device = None
+        else:
+            selected_device = self._get_selected_device()
+            if selected_device is not None:
+                suffix = "可直接投送" if selected_device.supports_media_cast else "建议使用兼容播放页"
+                self.header_device_var.set(f"{selected_device.display_name} · {suffix}")
+            elif self.devices:
+                self.header_device_var.set(f"已发现 {len(self.devices)} 台设备，等待选择")
+            else:
+                self.header_device_var.set("未选择电视/盒子")
+
+        if self.current_controller is not None:
+            next_step = "视频正在投送中，可复制兼容地址，或点击停止。"
+        elif self.mirror_url_var.get().startswith("http://"):
+            next_step = "兼容镜像已启动，请在电视浏览器中打开接收地址。"
+        elif self.player_url_var.get().startswith("http://"):
+            next_step = "兼容播放页已就绪，可复制到电视浏览器继续播放。"
+        elif self.selected_file is None and not self.selected_media_url:
+            next_step = "下一步：选择视频或输入网址。"
+        elif selected_device is None:
+            next_step = "下一步：扫描并选择电视 / 盒子。"
+        elif not selected_device.supports_media_cast:
+            next_step = "当前设备不支持 DLNA 直投，建议生成兼容播放页。"
+        else:
+            next_step = "可以开始 DLNA 推送，或先生成兼容播放页。"
+        self.header_next_step_var.set(next_step)
 
     def _build_projection_tab(self, parent: tk.Frame) -> None:
         cards_section = tk.Frame(parent, bg=PAGE_BG)
         cards_section.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         cards_section.columnconfigure(0, weight=1)
-        self._create_section_title(cards_section, "选择投屏方式", "把最常用的三种投屏方式放在首页卡片里，像正式产品一样一步完成选择。")
+        self._create_section_title(cards_section, "兼容投屏模式", "选择模式后开始投屏。")
 
         cards_grid = tk.Frame(cards_section, bg=PAGE_BG)
         cards_grid.pack(fill="x", pady=(14, 0))
@@ -209,46 +403,48 @@ class ScreenCastingApp(tk.Tk):
         middle.columnconfigure(0, weight=3)
         middle.columnconfigure(1, weight=2)
 
-        control_card = self._create_card(middle)
+        control_card = self._create_card(middle, padx=20, pady=20)
         control_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         control_card.columnconfigure(1, weight=1)
 
         head = tk.Frame(control_card, bg=CARD_BG)
         head.grid(row=0, column=0, columnspan=2, sticky="ew")
         head.columnconfigure(1, weight=1)
-        tk.Label(head, textvariable=self.selection_badge_var, bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).grid(row=0, column=0, sticky="w")
+        tk.Label(head, textvariable=self.selection_badge_var, bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).grid(row=0, column=0, sticky="w")
         tk.Label(head, textvariable=self.selection_title_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        tk.Label(head, textvariable=self.selection_summary_var, bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=600, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        tk.Label(head, textvariable=self.selection_summary_var, bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=620, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        tk.Label(control_card, text="屏幕选择", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=(18, 0))
-        self.monitor_combo = ttk.Combobox(control_card, textvariable=self.monitor_label_var, state="readonly", width=40, style="Soft.TCombobox")
-        self.monitor_combo.grid(row=1, column=1, sticky="ew", pady=(18, 0))
+        form_panel = tk.Frame(control_card, bg=SURFACE_SOFT, padx=16, pady=16)
+        form_panel.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        form_panel.columnconfigure(1, weight=1)
+        tk.Label(form_panel, text="屏幕选择", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        self.monitor_combo = ttk.Combobox(form_panel, textvariable=self.monitor_label_var, state="readonly", width=40, style="Soft.TCombobox")
+        self.monitor_combo.grid(row=0, column=1, sticky="ew")
 
-        tk.Label(control_card, text="镜像画质", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=2, column=0, sticky="w", pady=(14, 0))
-        self.preset_combo = ttk.Combobox(control_card, textvariable=self.mirror_preset_var, state="readonly", values=list(PRESET_LABEL_TO_KEY.keys()), width=18, style="Soft.TCombobox")
-        self.preset_combo.grid(row=2, column=1, sticky="w", pady=(14, 0))
+        tk.Label(form_panel, text="镜像画质", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=(14, 0))
+        self.preset_combo = ttk.Combobox(form_panel, textvariable=self.mirror_preset_var, state="readonly", values=list(PRESET_LABEL_TO_KEY.keys()), width=18, style="Soft.TCombobox")
+        self.preset_combo.grid(row=1, column=1, sticky="w", pady=(14, 0))
 
-        tk.Label(control_card, text="当前页面", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=3, column=0, sticky="nw", pady=(14, 0))
-        tk.Label(control_card, textvariable=self.selected_window_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=560, justify="left").grid(row=3, column=1, sticky="w", pady=(14, 0))
+        tk.Label(form_panel, text="当前页面", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=2, column=0, sticky="nw", pady=(14, 0))
+        tk.Label(form_panel, textvariable=self.selected_window_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=560, justify="left").grid(row=2, column=1, sticky="w", pady=(14, 0))
 
-        tk.Label(control_card, text="接收地址", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=4, column=0, sticky="nw", pady=(14, 0))
-        tk.Label(control_card, textvariable=self.mirror_url_var, bg=CARD_BG, fg=PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=560, justify="left").grid(row=4, column=1, sticky="w", pady=(14, 0))
+        tk.Label(form_panel, text="接收地址", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=3, column=0, sticky="nw", pady=(14, 0))
+        tk.Label(form_panel, textvariable=self.mirror_url_var, bg=SURFACE_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 10, "bold"), wraplength=560, justify="left").grid(row=3, column=1, sticky="w", pady=(14, 0))
 
-        note_card = tk.Frame(control_card, bg=PRIMARY_SOFT, padx=14, pady=12)
-        note_card.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(18, 0))
-        tk.Label(note_card, text="模式说明", bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-        tk.Label(note_card, textvariable=self.capture_note_var, bg=PRIMARY_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=680, justify="left").pack(anchor="w", pady=(6, 0))
+        note_card = tk.Frame(control_card, bg=SURFACE_SOFT, padx=14, pady=12)
+        note_card.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        tk.Label(note_card, text="说明", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(note_card, textvariable=self.capture_note_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=700, justify="left").pack(anchor="w", pady=(6, 0))
+
+        ttk.Button(control_card, textvariable=self.start_action_text_var, command=self.start_selected_projection, style="HeroPrimary.TButton").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
         action_row = tk.Frame(control_card, bg=CARD_BG)
-        action_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        action_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         for idx in range(3):
             action_row.columnconfigure(idx, weight=1)
-        ttk.Button(action_row, text="电脑全部投屏", command=self.start_full_desktop_projection, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(action_row, text="投屏一个屏幕", command=self.start_single_monitor_projection, style="Secondary.TButton").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Button(action_row, text="投屏当前页面", command=self.start_active_window_projection, style="Secondary.TButton").grid(row=0, column=2, sticky="ew")
-        ttk.Button(action_row, text="刷新屏幕列表", command=self.refresh_monitor_list, style="Secondary.TButton").grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(10, 0))
-        ttk.Button(action_row, text="停止兼容镜像", command=self.stop_mirror, style="Secondary.TButton").grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(10, 0))
-        ttk.Button(action_row, text="复制接收地址", command=self.copy_mirror_url, style="Secondary.TButton").grid(row=1, column=2, sticky="ew", pady=(10, 0))
+        ttk.Button(action_row, text="刷新屏幕列表", command=self.refresh_monitor_list, style="Secondary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(action_row, text="复制接收地址", command=self.copy_mirror_url, style="Secondary.TButton").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(action_row, text="停止兼容镜像", command=self.stop_mirror, style="Secondary.TButton").grid(row=0, column=2, sticky="ew")
 
         right_column = tk.Frame(middle, bg=PAGE_BG)
         right_column.grid(row=0, column=1, sticky="nsew")
@@ -258,7 +454,7 @@ class ScreenCastingApp(tk.Tk):
         status_card = self._create_card(right_column)
         status_card.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         tk.Label(status_card, text="投放环境概览", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        tk.Label(status_card, text="下方信息来自 netsh 和 dxdiag，用来判断这台电脑是否适合直接使用 Miracast。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").pack(anchor="w", pady=(6, 14))
+        tk.Label(status_card, text="集中展示 Miracast 相关判断信息。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").pack(anchor="w", pady=(6, 14))
         self._create_info_row(status_card, "系统", self.os_var)
         self._create_info_row(status_card, "无线网卡", self.wlan_var)
         self._create_info_row(status_card, "Miracast", self.miracast_var)
@@ -268,35 +464,29 @@ class ScreenCastingApp(tk.Tk):
         box_card = self._create_card(right_column)
         box_card.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         box_card.columnconfigure(0, weight=1)
-        box_card.rowconfigure(3, weight=1)
-        tk.Label(box_card, text="局域网盒子搜索", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(box_card, text="Win+K 只显示 Miracast 设备；天猫魔盒这类盒子通常要通过 DLNA/UPnP 在同一局域网中搜索。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-        summary_row = tk.Frame(box_card, bg=CARD_BG)
-        summary_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        tk.Label(summary_row, textvariable=self.device_count_var, bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).pack(side="left")
-        tk.Label(summary_row, text="同一 Wi-Fi 下自动发现", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9)).pack(side="right")
+        box_card.rowconfigure(2, weight=1)
+        box_head = tk.Frame(box_card, bg=CARD_BG)
+        box_head.grid(row=0, column=0, sticky="ew")
+        box_head.columnconfigure(0, weight=1)
+        tk.Label(box_head, text="局域网电视 / 盒子", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(box_head, text="扫描设备", command=self.scan_devices, style="Secondary.TButton").grid(row=0, column=1, sticky="e")
+        tk.Label(box_card, text="Win+K 不可用时，仍可尝试兼容镜像或媒体投送。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         list_frame = tk.Frame(box_card, bg=CARD_BG)
-        list_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        list_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        self.home_device_list = tk.Listbox(list_frame, exportselection=False, relief="flat", borderwidth=0, height=7, font=("Microsoft YaHei UI", 10), highlightthickness=0)
+        self.home_device_list = self._create_listbox(list_frame, height=7)
         self.home_device_list.grid(row=0, column=0, sticky="nsew")
         self.home_device_list.bind("<<ListboxSelect>>", self._on_home_device_select)
         home_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.home_device_list.yview)
         home_scrollbar.grid(row=0, column=1, sticky="ns")
         self.home_device_list.configure(yscrollcommand=home_scrollbar.set)
 
-        tk.Label(box_card, text="当前选中", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=4, column=0, sticky="w", pady=(12, 0))
-        tk.Label(box_card, textvariable=self.selected_box_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=320, justify="left").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        tk.Label(box_card, textvariable=self.box_status_var, bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(box_card, text="扫描局域网盒子", command=self.scan_devices, style="Secondary.TButton").grid(row=7, column=0, sticky="ew", pady=(14, 0))
-
         quick_card = self._create_card(right_column)
         quick_card.grid(row=2, column=0, sticky="nsew")
-        tk.Label(quick_card, text="快捷操作", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        tk.Label(quick_card, text="像正式产品一样把常用系统入口直接放到一张卡片里。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").pack(anchor="w", pady=(6, 14))
+        tk.Label(quick_card, text="系统入口", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
+        tk.Label(quick_card, text="快速打开系统投放相关入口。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="left").pack(anchor="w", pady=(6, 14))
         ttk.Button(quick_card, text="检测投放环境", command=self.refresh_projection_info, style="Secondary.TButton").pack(fill="x")
         ttk.Button(quick_card, text="打开 Win+K 投放面板", command=self.open_connect_panel, style="Primary.TButton").pack(fill="x", pady=(10, 0))
         ttk.Button(quick_card, text="打开显示设置", command=self.open_display_settings, style="Secondary.TButton").pack(fill="x", pady=(10, 0))
@@ -311,25 +501,25 @@ class ScreenCastingApp(tk.Tk):
         diag_card = self._create_card(bottom)
         diag_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         tk.Label(diag_card, text="诊断详情", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        tk.Label(diag_card, text="这里会展示投放检测的原始摘要，方便定位是否是驱动、无线网卡还是电视端能力问题。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=640, justify="left").pack(anchor="w", pady=(6, 12))
-        self.diag_text = scrolledtext.ScrolledText(diag_card, wrap="word", height=16, relief="flat", borderwidth=0, font=("Consolas", 10))
+        tk.Label(diag_card, text="保留原始检测摘要，便于排查。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=640, justify="left").pack(anchor="w", pady=(6, 12))
+        self.diag_text = scrolledtext.ScrolledText(diag_card, wrap="word", height=16, relief="flat", borderwidth=0, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Consolas", 10))
         self.diag_text.pack(fill="both", expand=True)
         self.diag_text.insert("1.0", "检测结果会显示在这里。\n\n推荐操作：\n1. 电脑全部投屏：点击 Win+K 连接电视。\n2. 投屏一个屏幕：生成接收地址，在电视浏览器打开。\n3. 投屏当前页面：点击开始后 3 秒内切到目标页面。")
         self.diag_text.configure(state="disabled")
 
         guide_card = self._create_card(bottom)
         guide_card.grid(row=0, column=1, sticky="nsew")
-        tk.Label(guide_card, text="推荐使用路径", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
+        tk.Label(guide_card, text="使用建议", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
         for step in [
             "先点“检测投放环境”，确认 Miracast 是否可用。",
-            "如果电视支持无线显示，优先使用“电脑全部投屏”。",
-            "如果只想共享某块显示器，选择“投屏一个屏幕”。",
-            "如果只想演示某个应用窗口，选择“投屏当前页面”。",
+            "电视支持无线显示时，优先使用“电脑全部投屏”。",
+            "只共享某块显示器时，选择“投屏一个屏幕”。",
+            "只演示某个应用窗口时，选择“投屏当前页面”。",
             "兼容镜像模式启动后，在电视浏览器中打开接收地址。",
         ]:
             line = tk.Frame(guide_card, bg=CARD_BG)
             line.pack(fill="x", pady=(10, 0))
-            tk.Label(line, text="●", bg=CARD_BG, fg=PRIMARY, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", anchor="n")
+            tk.Label(line, text="•", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", anchor="n")
             tk.Label(line, text=step, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=300, justify="left").pack(side="left", padx=(8, 0))
 
         self._on_projection_target_changed()
@@ -340,13 +530,13 @@ class ScreenCastingApp(tk.Tk):
         card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
         parent.columnconfigure(column, weight=1)
 
-        badge = tk.Label(card, text=meta["badge"], bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4)
+        badge = tk.Label(card, text=meta["badge"], bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4)
         badge.pack(anchor="w")
-        title = tk.Label(card, text=meta["title"], bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 14, "bold"))
+        title = tk.Label(card, text=meta["title"], bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold"))
         title.pack(anchor="w", pady=(14, 0))
         desc = tk.Label(card, text=meta["summary"], bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=280, justify="left")
         desc.pack(anchor="w", pady=(10, 0))
-        hint = tk.Label(card, text=meta["detail"], bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 9), wraplength=280, justify="left")
+        hint = tk.Label(card, text=meta["detail"], bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=280, justify="left")
         hint.pack(anchor="w", pady=(12, 0))
         button = ttk.Button(card, text="选择此模式", command=lambda value=mode: self.select_projection_target(value), style="Secondary.TButton")
         button.pack(fill="x", pady=(16, 0))
@@ -386,6 +576,7 @@ class ScreenCastingApp(tk.Tk):
                 self.box_status_var.set("请选择一台盒子后再进行媒体投屏。")
             else:
                 self.box_status_var.set("未发现支持 DLNA/UPnP 的盒子。你可以改用“生成兼容播放页”，在电视浏览器中打开。")
+            self._refresh_overview_state()
             return
 
         device = self.devices[index]
@@ -398,6 +589,7 @@ class ScreenCastingApp(tk.Tk):
             self.box_status_var.set("已识别到可用于 DLNA 媒体投屏的盒子。")
         else:
             self.box_status_var.set("已发现盒子，但未识别到 DLNA 播放控制服务。你可以改用电视浏览器播放页。")
+        self._refresh_overview_state()
 
     def _sync_device_views(self, preferred_index: int | None = None) -> None:
         names = [device.display_name for device in self.devices]
@@ -431,102 +623,151 @@ class ScreenCastingApp(tk.Tk):
     def _on_media_device_select(self, event=None) -> None:
         if hasattr(self, "device_list"):
             self._handle_device_select(self.device_list)
+
     def _build_media_tab(self, parent: tk.Frame) -> None:
-        banner = self._create_card(parent, padx=18, pady=16)
+        banner = self._create_card(parent, padx=22, pady=18)
         banner.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-        tk.Label(banner, text="视频投送主流程", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        tk.Label(banner, text="视频投送", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
         tk.Label(
             banner,
-            text="优先扫描支持 DLNA 的电视和盒子直接推送视频；支持本地文件、网络视频直链，也支持输入视频播放页地址后自动解析真实视频流再直投。",
+            text="设备选择、来源处理和兼容地址统一放在一个工作区内。",
             bg=CARD_BG,
             fg=TEXT_SECONDARY,
             font=("Microsoft YaHei UI", 10),
-            wraplength=980,
+            wraplength=1060,
             justify="left",
         ).pack(anchor="w", pady=(6, 0))
+
+        banner_row = tk.Frame(banner, bg=CARD_BG)
+        banner_row.pack(fill="x", pady=(16, 0))
+        banner_row.columnconfigure(0, weight=1)
+        banner_row.columnconfigure(1, weight=1)
+
+        source_banner = tk.Frame(banner_row, bg=SURFACE_SOFT, padx=14, pady=12)
+        source_banner.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        tk.Label(source_banner, text="当前来源", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(source_banner, textvariable=self.source_type_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 11, "bold"), justify="left").pack(anchor="w", pady=(10, 0))
+        tk.Label(source_banner, textvariable=self.source_tip_var, bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=500, justify="left").pack(anchor="w", pady=(6, 0))
+
+        action_banner = tk.Frame(banner_row, bg=SURFACE_SOFT, padx=14, pady=12)
+        action_banner.grid(row=0, column=1, sticky="nsew")
+        tk.Label(action_banner, text="下一步", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(action_banner, textvariable=self.header_next_step_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 11, "bold"), wraplength=500, justify="left").pack(anchor="w", pady=(10, 0))
+        tk.Label(action_banner, text="DLNA 不稳定时，可改用兼容播放页。", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=500, justify="left").pack(anchor="w", pady=(6, 0))
 
         content = tk.Frame(parent, bg=PAGE_BG)
         content.grid(row=1, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
+        content.columnconfigure(0, weight=5)
+        content.columnconfigure(1, weight=6)
         content.rowconfigure(0, weight=1)
 
-        device_card = self._create_card(content)
+        device_card = self._create_card(content, padx=20, pady=20)
         device_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         device_card.columnconfigure(0, weight=1)
-        device_card.rowconfigure(2, weight=1)
-        tk.Label(device_card, text="局域网盒子与电视", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w")
+        device_card.rowconfigure(3, weight=1)
+
+        device_head = tk.Frame(device_card, bg=CARD_BG)
+        device_head.grid(row=0, column=0, sticky="ew")
+        device_head.columnconfigure(0, weight=1)
+        tk.Label(device_head, text="设备列表", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(device_head, text="重新扫描", command=self.scan_devices, style="Secondary.TButton").grid(row=0, column=1, sticky="e")
+        tk.Label(device_card, text="自动发现同一局域网内支持 DLNA / UPnP 的设备。", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=520, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         device_meta = tk.Frame(device_card, bg=CARD_BG)
-        device_meta.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        tk.Label(device_meta, textvariable=self.device_count_var, bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).pack(side="left")
+        device_meta.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        tk.Label(device_meta, textvariable=self.device_count_var, bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).pack(side="left")
         tk.Label(device_meta, textvariable=self.selected_box_var, bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9), wraplength=320, justify="right").pack(side="right")
 
-        self.device_list = tk.Listbox(device_card, exportselection=False, relief="flat", borderwidth=0, font=("Microsoft YaHei UI", 10), highlightthickness=0)
-        self.device_list.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        list_frame = tk.Frame(device_card, bg=CARD_BG)
+        list_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        self.device_list = self._create_listbox(list_frame, height=11)
+        self.device_list.grid(row=0, column=0, sticky="nsew")
         self.device_list.bind("<<ListboxSelect>>", self._on_media_device_select)
+        device_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.device_list.yview)
+        device_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.device_list.configure(yscrollcommand=device_scrollbar.set)
 
-        device_note = tk.Frame(device_card, bg=PRIMARY_SOFT, padx=12, pady=12)
-        device_note.grid(row=3, column=0, sticky="ew", pady=(16, 0))
-        tk.Label(device_note, text="设备提示", bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-        tk.Label(device_note, textvariable=self.box_status_var, bg=PRIMARY_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=520, justify="left").pack(anchor="w", pady=(6, 0))
+        device_note = tk.Frame(device_card, bg=SURFACE_SOFT, padx=12, pady=12)
+        device_note.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        tk.Label(device_note, text="当前状态", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(device_note, textvariable=self.box_status_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=520, justify="left").pack(anchor="w", pady=(6, 0))
 
-        control_card = self._create_card(content)
+        control_card = self._create_card(content, padx=20, pady=20)
         control_card.grid(row=0, column=1, sticky="nsew")
-        control_card.columnconfigure(1, weight=1)
-        tk.Label(control_card, text="视频投送控制", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        control_card.columnconfigure(0, weight=1)
+
+        tk.Label(control_card, text="来源与操作", bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 13, "bold")).grid(row=0, column=0, sticky="w")
+
+        source_panel = tk.Frame(control_card, bg=SURFACE_SOFT, padx=16, pady=16)
+        source_panel.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        source_panel.columnconfigure(0, weight=1)
+        source_panel.columnconfigure(1, weight=0)
+        tk.Label(source_panel, text="当前来源", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(source_panel, textvariable=self.source_type_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=4).grid(row=0, column=1, sticky="e")
+        tk.Label(source_panel, textvariable=self.file_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10, "bold"), wraplength=540, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        tk.Label(source_panel, textvariable=self.source_tip_var, bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 10), wraplength=540, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         button_row = tk.Frame(control_card, bg=CARD_BG)
-        button_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        button_row.grid(row=2, column=0, sticky="ew", pady=(14, 0))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
-        button_row.columnconfigure(2, weight=1)
-        ttk.Button(button_row, text="选择视频", command=self.choose_file, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(button_row, text="输入网址", command=self.use_media_url, style="Secondary.TButton").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Button(button_row, text="扫描盒子", command=self.scan_devices, style="Secondary.TButton").grid(row=0, column=2, sticky="ew")
+        ttk.Button(button_row, text="选择本地视频", command=self.choose_file, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(button_row, text="输入网络网址", command=self.use_media_url, style="Secondary.TButton").grid(row=0, column=1, sticky="ew")
 
-        tk.Label(control_card, text="当前来源", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=2, column=0, sticky="nw", pady=(16, 0))
-        tk.Label(control_card, textvariable=self.file_var, bg=CARD_BG, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=320, justify="left").grid(row=2, column=1, sticky="w", pady=(16, 0))
+        options_row = tk.Frame(control_card, bg=CARD_BG)
+        options_row.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        options_row.columnconfigure(0, weight=1)
+        options_row.columnconfigure(1, weight=1)
 
-        tk.Label(control_card, text="播放速度", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=3, column=0, sticky="w", pady=(16, 0))
-        ttk.Combobox(control_card, textvariable=self.speed_var, state="readonly", values=["1", "1.25", "1.5", "2"], width=12, style="Soft.TCombobox").grid(row=3, column=1, sticky="w", pady=(16, 0))
+        speed_card = tk.Frame(options_row, bg=SURFACE_SOFT, padx=14, pady=12)
+        speed_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        tk.Label(speed_card, text="播放速度", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        ttk.Combobox(speed_card, textvariable=self.speed_var, state="readonly", values=["1", "1.25", "1.5", "2"], width=12, style="Soft.TCombobox").pack(anchor="w", pady=(8, 0))
 
-        tk.Label(control_card, text="音量", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=4, column=0, sticky="w", pady=(16, 0))
-        ttk.Scale(control_card, from_=0, to=100, variable=self.volume_var, orient="horizontal", length=190).grid(row=4, column=1, sticky="w", pady=(16, 0))
+        volume_card = tk.Frame(options_row, bg=SURFACE_SOFT, padx=14, pady=12)
+        volume_card.grid(row=0, column=1, sticky="ew")
+        head_row = tk.Frame(volume_card, bg=SURFACE_SOFT)
+        head_row.pack(fill="x")
+        tk.Label(head_row, text="音量", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        tk.Label(head_row, textvariable=self.volume_text_var, bg=SURFACE_SOFT, fg=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10, "bold")).pack(side="right")
+        ttk.Scale(volume_card, from_=0, to=100, variable=self.volume_var, orient="horizontal").pack(fill="x", pady=(8, 0))
 
-        tk.Label(control_card, text="兼容视频地址", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=5, column=0, sticky="nw", pady=(16, 0))
-        tk.Label(control_card, textvariable=self.media_url_var, bg=CARD_BG, fg=PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=320, justify="left").grid(row=5, column=1, sticky="w", pady=(16, 0))
-
-        tk.Label(control_card, text="兼容播放页地址", bg=CARD_BG, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=6, column=0, sticky="nw", pady=(16, 0))
-        tk.Label(control_card, textvariable=self.player_url_var, bg=CARD_BG, fg=PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=320, justify="left").grid(row=6, column=1, sticky="w", pady=(16, 0))
+        urls_card = tk.Frame(control_card, bg=SURFACE_SOFT, padx=16, pady=16)
+        urls_card.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        urls_card.columnconfigure(0, weight=1)
+        urls_card.columnconfigure(1, weight=0)
+        tk.Label(urls_card, text="兼容视频地址", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(urls_card, text="复制视频地址", command=self.copy_media_url, style="Secondary.TButton").grid(row=0, column=1, sticky="e")
+        tk.Label(urls_card, textvariable=self.media_url_var, bg=SURFACE_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=520, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        tk.Label(urls_card, text="兼容播放页地址", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).grid(row=2, column=0, sticky="w", pady=(14, 0))
+        ttk.Button(urls_card, text="复制播放页", command=self.copy_player_url, style="Secondary.TButton").grid(row=2, column=1, sticky="e", pady=(14, 0))
+        tk.Label(urls_card, textvariable=self.player_url_var, bg=SURFACE_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 10), wraplength=520, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         action_row = tk.Frame(control_card, bg=CARD_BG)
-        action_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(20, 0))
+        action_row.grid(row=5, column=0, sticky="ew", pady=(18, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
-        ttk.Button(action_row, text="开始 DLNA 推送", command=self.cast_media, style="Primary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(action_row, text="开始 DLNA 推送", command=self.cast_media, style="HeroPrimary.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(action_row, text="生成兼容播放页", command=self.prepare_video_delivery, style="Secondary.TButton").grid(row=0, column=1, sticky="ew")
-        ttk.Button(action_row, text="复制兼容视频地址", command=self.copy_media_url, style="Secondary.TButton").grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(10, 0))
-        ttk.Button(action_row, text="复制兼容播放页", command=self.copy_player_url, style="Secondary.TButton").grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        ttk.Button(action_row, text="停止视频投送", command=self.stop_casting, style="Secondary.TButton").grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(action_row, text="停止视频投送", command=self.stop_casting, style="Secondary.TButton").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
-        note = tk.Frame(control_card, bg=PRIMARY_SOFT, padx=12, pady=12)
-        note.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 0))
-        tk.Label(note, text="使用建议", bg=PRIMARY_SOFT, fg=PRIMARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        note = tk.Frame(control_card, bg=SURFACE_SOFT, padx=12, pady=12)
+        note.grid(row=6, column=0, sticky="ew", pady=(18, 0))
+        tk.Label(note, text="说明", bg=SURFACE_SOFT, fg=TEXT_SECONDARY, font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
         tk.Label(
             note,
             text="支持输入视频播放页地址。程序会优先解析真实视频流，再按 DLNA 方式直接推送到盒子；如果站点启用了 DRM、登录校验或强加密，解析可能失败。",
-            bg=PRIMARY_SOFT,
+            bg=SURFACE_SOFT,
             fg=TEXT_PRIMARY,
             font=("Microsoft YaHei UI", 10),
-            wraplength=320,
+            wraplength=540,
             justify="left",
         ).pack(anchor="w", pady=(6, 0))
 
-
     def select_projection_target(self, target: str) -> None:
         if self.projection_target_var.get() == target:
-            self.start_selected_projection()
             return
         self.projection_target_var.set(target)
         self._on_projection_target_changed()
@@ -552,6 +793,8 @@ class ScreenCastingApp(tk.Tk):
             self.monitor_combo.configure(state="disabled")
             self.preset_combo.configure(state="readonly")
 
+        self._refresh_overview_state()
+
     def _refresh_choice_card_styles(self) -> None:
         selected = self.projection_target_var.get()
         for mode, refs in self.choice_cards.items():
@@ -562,18 +805,18 @@ class ScreenCastingApp(tk.Tk):
             desc = refs["desc"]
             hint = refs["hint"]
             is_selected = mode == selected
-            bg = PRIMARY_SOFT if is_selected else CARD_BG
+            bg = SURFACE_SOFT if is_selected else CARD_BG
             border = PRIMARY if is_selected else CARD_BORDER
-            badge_bg = PRIMARY if is_selected else PRIMARY_SOFT
-            badge_fg = "#FFFFFF" if is_selected else PRIMARY
-            title_fg = PRIMARY if is_selected else TEXT_PRIMARY
+            badge_bg = PRIMARY_SOFT if is_selected else SURFACE_SOFT
+            badge_fg = PRIMARY if is_selected else TEXT_SECONDARY
+            title_fg = TEXT_PRIMARY
             desc_fg = TEXT_PRIMARY if is_selected else TEXT_SECONDARY
             frame.configure(bg=bg, highlightbackground=border, highlightcolor=border)
             badge.configure(bg=badge_bg, fg=badge_fg)
             title.configure(bg=bg, fg=title_fg)
             desc.configure(bg=bg, fg=desc_fg)
-            hint.configure(bg=bg, fg=TEXT_PRIMARY)
-            button.configure(text="再次点击开始" if is_selected else "选择此模式")
+            hint.configure(bg=bg, fg=TEXT_SECONDARY)
+            button.configure(style="Primary.TButton" if is_selected else "Secondary.TButton", text="当前模式" if is_selected else "选中此模式")
 
     def refresh_projection_info(self) -> None:
         self.status_var.set("正在检测 Windows 投放环境…")
@@ -627,13 +870,15 @@ class ScreenCastingApp(tk.Tk):
 
     def start_full_desktop_projection(self) -> None:
         self.select_projection_target(CAPTURE_MODE_FULL_DESKTOP)
+        self.start_selected_projection()
 
     def start_single_monitor_projection(self) -> None:
         self.select_projection_target(CAPTURE_MODE_SINGLE_MONITOR)
+        self.start_selected_projection()
 
     def start_active_window_projection(self) -> None:
         self.select_projection_target(CAPTURE_MODE_ACTIVE_WINDOW)
-
+        self.start_selected_projection()
     def start_selected_projection(self) -> None:
         target = self.projection_target_var.get()
         if target == CAPTURE_MODE_FULL_DESKTOP:
@@ -690,6 +935,7 @@ class ScreenCastingApp(tk.Tk):
         self.mirror_url_var.set(url)
         self.selected_window_var.set(config.window_title or "未锁定页面")
         self.status_var.set(f"兼容镜像已启动：{target_label}。请在电视浏览器中打开接收地址。")
+        self._refresh_overview_state()
         messagebox.showinfo(
             "投屏启动成功",
             f"{target_label} 已启动成功。\n\n接收地址：{url}\n\n请在电视浏览器中打开这个地址完成投屏。",
@@ -698,16 +944,19 @@ class ScreenCastingApp(tk.Tk):
     def _apply_mirror_start_failed(self, target_label: str, error: str) -> None:
         messagebox.showerror("投屏启动失败", f"{target_label} 启动失败：\n{error}")
         self.status_var.set(f"{target_label} 启动失败。")
+        self._refresh_overview_state()
 
     def _apply_active_window_start_failed(self, error: str) -> None:
         messagebox.showerror("当前页面投屏启动失败", f"无法开始当前页面投屏：\n{error}")
         self.status_var.set("当前页面投屏启动失败。")
+        self._refresh_overview_state()
 
     def stop_mirror(self) -> None:
         self.mirror_server.stop()
         self.mirror_url_var.set("当前未启动兼容镜像地址")
         self.selected_window_var.set("未锁定页面")
         self.status_var.set("已停止兼容镜像。")
+        self._refresh_overview_state()
 
     def copy_mirror_url(self) -> None:
         value = self.mirror_url_var.get()
@@ -721,10 +970,12 @@ class ScreenCastingApp(tk.Tk):
     def _clear_video_delivery_urls(self) -> None:
         self.media_url_var.set("当前未生成兼容视频地址")
         self.player_url_var.set("当前未生成兼容播放页地址")
+        self._refresh_overview_state()
 
     def _sync_video_delivery_urls(self, media_url: str | None, player_url: str | None) -> None:
         self.media_url_var.set(media_url or "当前未生成兼容视频地址")
         self.player_url_var.set(player_url or "当前未生成兼容播放页地址")
+        self._refresh_overview_state()
 
     def _get_selected_media_source(self) -> Path | str | None:
         if self.selected_file is not None:
@@ -856,6 +1107,7 @@ class ScreenCastingApp(tk.Tk):
         self.selected_box_var.set("正在扫描…")
         for widget in self._device_list_widgets():
             widget.delete(0, tk.END)
+        self._refresh_overview_state()
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
     def _scan_worker(self) -> None:
@@ -871,6 +1123,7 @@ class ScreenCastingApp(tk.Tk):
         self.selected_box_var.set("未选择盒子")
         self.box_status_var.set("请检查电脑网络是否正常，并确认盒子与电脑处于同一局域网。")
         self.status_var.set(f"扫描失败：{error}")
+        self._refresh_overview_state()
 
     def _update_devices(self, devices: list[DlnaDevice]) -> None:
         self.devices = devices
@@ -879,6 +1132,7 @@ class ScreenCastingApp(tk.Tk):
             self.status_var.set(f"扫描完成：发现 {len(devices)} 台局域网盒子/电视。")
         else:
             self.status_var.set("扫描完成：未发现支持 DLNA 的盒子。你仍可先输入视频播放页地址解析直投源，或改用兼容播放页。")
+        self._refresh_overview_state()
 
     def choose_file(self) -> None:
         file_path = filedialog.askopenfilename(title="选择要投送的视频文件", filetypes=[("视频文件", "*.mp4 *.mkv *.avi *.mov *.wmv *.ts *.flv *.m4v *.webm"), ("所有文件", "*.*")])
@@ -891,6 +1145,7 @@ class ScreenCastingApp(tk.Tk):
         self.selected_file = new_file
         self.file_var.set(str(self.selected_file))
         self.status_var.set("已选择本地视频文件。生成兼容播放页或开始 DLNA 推送时会自动转为兼容 MP4(H.264/AAC)。")
+        self._refresh_overview_state()
 
     def use_media_url(self) -> None:
         current_value = self.selected_media_url or ""
@@ -912,6 +1167,7 @@ class ScreenCastingApp(tk.Tk):
             self.status_var.set("已选择网络视频直链。可以直接生成播放页或尝试 DLNA 直投。")
         else:
             self.status_var.set("已选择视频播放页地址。开始视频投送时会先解析真实视频地址，再直接推送到盒子。")
+        self._refresh_overview_state()
 
     def _get_selected_device(self) -> DlnaDevice | None:
         for widget in self._device_list_widgets():
@@ -966,6 +1222,7 @@ class ScreenCastingApp(tk.Tk):
             except (ValueError, HTTPError, URLError):
                 pass
             self.current_controller = controller
+            self.after(0, self._refresh_overview_state)
         except (HTTPError, URLError, OSError, RuntimeError) as exc:
             self.after(0, lambda error=str(exc): messagebox.showerror("视频投送失败", f"{error}\n\n已保留兼容播放页地址，可使用“复制兼容播放页”继续播放。"))
             self.after(0, lambda: self.status_var.set("视频投送失败，但已保留兼容播放页地址，可直接复制。"))
@@ -990,6 +1247,7 @@ class ScreenCastingApp(tk.Tk):
         self.current_controller = None
         self.after(0, self._clear_video_delivery_urls)
         self.after(0, lambda: self.status_var.set("已停止视频投送。"))
+        self.after(0, self._refresh_overview_state)
 
     def _on_close(self) -> None:
         self.http_server.stop()
@@ -1000,5 +1258,14 @@ class ScreenCastingApp(tk.Tk):
 def run() -> None:
     app = ScreenCastingApp()
     app.mainloop()
+
+
+
+
+
+
+
+
+
 
 
